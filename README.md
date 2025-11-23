@@ -37,6 +37,22 @@ Then build using dotnet (tested on dotnet 9.0.108, on Ubuntu 24.04):
 dotnet build --configuration=Release unity-debug-adapter/unity-debug-adapter.csproj
 ```
 
+If you get build error messages related to `Microsoft.SymbolStore` and `Microsoft.FileFormats`
+such as these:
+
+```bash
+/unity-dap/unity-debug-adapter/unity-debug-adapter.csproj : error NU1101: Unable to find package Microsoft.SymbolStore. No packages exist with this id in source(s): nuget.org
+/unity-dap/unity-debug-adapter/unity-debug-adapter.csproj : error NU1101: Unable to find package Microsoft.FileFormats. No packages exist with this id in source(s): nuget.org
+```
+
+Then make sure to add outdated packages as a source for Nuget and then run the build command
+again (the error is not caused by this project but rather its Mono debugger dependency -
+see [this issue](https://github.com/mono/debugger-libs/issues/402)):
+
+```bash
+dotnet nuget add source 'https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet-tools/nuget/v3/index.json' -n "OutdatedPackages"
+```
+
 Then, if you want to run the debug adapter, a global installation of Mono has to be
 available:
 
