@@ -53,11 +53,10 @@ see [this issue](https://github.com/mono/debugger-libs/issues/402)):
 dotnet nuget add source 'https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet-tools/nuget/v3/index.json' -n "OutdatedPackages"
 ```
 
-Then, if you want to run the debug adapter, a global installation of Mono has to be
-available:
+Then, if you want to run the debug adapter:
 
 ```bash
-mono bin/Release/unity-debug-adapter.exe
+bin/Release/unity-debug-adapter.exe
 ```
 
 You should then be seeying an output like this:
@@ -76,8 +75,9 @@ You should then be seeying an output like this:
   is output to stderr.
 
 Example of an invocation:
+
 ```bash
-mono bin/Release/unity-debug-adapter.exe --trace-level=trace --log-file=dap-log.txt
+unity-debug-adapter.exe --trace-level=trace --log-file=dap-log.txt
 ```
 
 
