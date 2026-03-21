@@ -2,6 +2,11 @@
 
 Unity Debug Adapter (DA) for debugging the Unity Editor or applications using the Mono scripting
 backend.
+
+> [!IMPORTANT]
+> I am currently re-writing this project. There are a couple of issues and using dotnet rather
+> than Mono to run this seems problematic.
+
 > [!IMPORTANT]
 > debugging IL2CPP applications is not supported.
 
