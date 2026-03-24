@@ -1,5 +1,3 @@
-#pragma warning disable IDE1006, IDE0003, IDE0038, IDE0001, IDE0031
-
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -8,7 +6,6 @@ using System.Net;
 using System.Threading;
 using Mono.Debugging.Client;
 using Mono.Debugging.Soft;
-using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
 namespace UnityDebugAdapter
@@ -19,7 +16,7 @@ namespace UnityDebugAdapter
     {
       protected override void OnExit()
       {
-        this.Detach();
+        Detach();
       }
     }
 
@@ -74,10 +71,17 @@ namespace UnityDebugAdapter
         return true;
       };
 
-      m_Session.LogWriter = (isStdErr, text) =>
-      {
-        SendOutput(isStdErr ? "stderr" : "stdout", text);
-      };
+      // these are commented because they absolutely flood the REPL for front-end DAP clients
+      // m_Session.LogWriter = (isStdErr, text) =>
+      // {
+      //   SendOutput(isStdErr ? "stderr" : "stdout", text);
+      // };
+      //
+      //
+      // m_Session.OutputWriter = (isStdErr, text) =>
+      // {
+      //   SendOutput(isStdErr ? "stderr" : "stdout", text);
+      // };
 
       m_Session.TargetStopped += (sender, e) =>
       {
@@ -186,28 +190,46 @@ namespace UnityDebugAdapter
         SendEvent(new ThreadEvent("exited", tid));
       };
 
-      m_Session.OutputWriter = (isStdErr, text) =>
-      {
-        SendOutput(isStdErr ? "stderr" : "stdout", text);
-      };
-
       Logger.LogInfo("done constructing UnityDebugSession");
     }
 
     public Mono.Debugging.Client.StackFrame Frame { get; set; }
 
-    public override void Initialize(Response response, dynamic args)
+    public override void Initialize(int reqSeq, JToken args)
     {
+
+      var initilizeReqArgs = args.ToObject<InitializeRequestArguments>();
+      _clientLinesStartAt1 = initilizeReqArgs.linesStartAt1 ?? true;
+
+      var pathFormat = initilizeReqArgs.pathFormat;
+      if (pathFormat != null)
+      {
+        switch (pathFormat)
+        {
+          case "uri":
+            _clientPathsAreURI = true;
+            break;
+          case "path":
+            _clientPathsAreURI = false;
+            break;
+          default:
+            SendErrorResponse(reqSeq, "initialize", 1015, "initialize: bad value '{_format}' for pathFormat",
+                new Dictionary<string, string> { { "_format", pathFormat } });
+            return;
+        }
+      }
+
       var os = Environment.OSVersion;
       if (os.Platform != PlatformID.MacOSX && os.Platform != PlatformID.Unix && os.Platform != PlatformID.Win32NT)
       {
-        SendErrorResponse(response, 3000, "Mono Debug is not supported on this platform ({_platform}).", new { _platform = os.Platform.ToString() }, true, true);
+        SendErrorResponse(reqSeq, "initialize", 3000, "Mono Debug is not supported on this platform ({_platform}).",
+            new Dictionary<string, string> { { "_platform", os.Platform.ToString() } }, true, true);
         return;
       }
 
       SendOutput("stdout", "UnityDebug: Initializing");
 
-      SendResponse(response, new Capabilities()
+      var capabilities = new Capabilities()
       {
         // This debug adapter does not need the configurationDoneRequest.
         supportsConfigurationDoneRequest = false,
@@ -229,71 +251,88 @@ namespace UnityDebugAdapter
 
         // This debug adapter does not support exception breakpoint filters
         exceptionBreakpointFilters = new ExceptionBreakpointsFilter[0]
-      });
+      };
+      var response = new Response()
+      {
+        command = "initialize",
+        request_seq = reqSeq,
+        success = true,
+        body = capabilities,
+      };
+      SendMessage(response);
 
       // Mono Debug is ready to accept breakpoints immediately
       SendEvent(new InitializedEvent());
     }
 
-    public override void Launch(Response response, dynamic args)
+    public override void Launch(int reqSeq, JToken args)
     {
-      Attach(response, args);
+      AttachInternal(args);
+      var response = new Response()
+      {
+        command = "launch",
+        request_seq = reqSeq,
+        success = true,
+      };
+      SendMessage(response);
     }
 
-    public override void Attach(Response response, dynamic args)
+    public override void Attach(int reqSeq, JToken args)
     {
-      string address_str = GetString(args, "address");
-      if (address_str == null)
+      AttachInternal(args);
+      var response = new Response()
+      {
+        command = "attach",
+        request_seq = reqSeq,
+        success = true,
+      };
+      SendMessage(response);
+    }
+
+    void AttachInternal(JToken args)
+    {
+      var attachArgs = args.ToObject<LaunchRequestArguments>();
+
+      if (attachArgs.address == null)
       {
         Logger.LogError("expected \"address\" property string in attach's arguments request");
         return;
       }
-      IPAddress address = IPAddress.Parse(address_str);
-      int port = GetInt(args, "port", -1);
-      if (port == -1)
+      IPAddress address = IPAddress.Parse(attachArgs.address);
+      ushort port;
+      if (attachArgs.port == null)
       {
         Logger.LogError("expected \"port\" property int with a valid port in attach's arguments request");
         return;
       }
+      port = attachArgs.port.Value;
 
-      SetExceptionBreakpoints(args.__exceptionOptions);
+      SetExceptionBreakpoints(attachArgs.__exceptionOptions);
 
       Connect(address, port);
 
       SendOutput("stdout", $"UnityDebugAdapter: attached to Unity Mono runtime endpoint via {address}:{port}");
-
-      SendResponse(response);
     }
 
-    static string CleanPath(string pathToEditorInstanceJson)
-    {
-      var osVersion = Environment.OSVersion;
-      if (osVersion.Platform == PlatformID.MacOSX || osVersion.Platform == PlatformID.Unix)
-      {
-        return pathToEditorInstanceJson;
-      }
-
-      return pathToEditorInstanceJson.TrimStart('/');
-    }
 
     void Connect(IPAddress address, int port)
     {
       Logger.LogInfo($"connecting to: {address}:{port}");
       lock (m_Lock)
       {
-        var args0 = new SoftDebuggerConnectArgs(string.Empty, address, port)
+        var startArgs = new SoftDebuggerConnectArgs(string.Empty, address, port)
         {
           MaxConnectionAttempts = MAX_CONNECTION_ATTEMPTS,
           TimeBetweenConnectionAttempts = CONNECTION_ATTEMPT_INTERVAL
         };
 
-        m_Session.Run(new SoftDebuggerStartInfo(args0), m_DebuggerSessionOptions);
+        m_Session.Run(new SoftDebuggerStartInfo(startArgs), m_DebuggerSessionOptions);
 
         m_DebuggeeExecuting = true;
       }
     }
 
-    void SetExceptionBreakpoints(dynamic exceptionOptions)
+    void SetExceptionBreakpoints(ExceptionOptions[] exceptionOptions)
     {
       if (exceptionOptions == null)
       {
@@ -308,36 +347,21 @@ namespace UnityDebugAdapter
 
       m_Catchpoints.Clear();
 
-      var exceptions = exceptionOptions.ToObject<dynamic[]>();
-      for (var i = 0; i < exceptions.Length; i++)
+      foreach (ExceptionOptions exception in exceptionOptions)
       {
-        var exception = exceptions[i];
-
         string exName = null;
         string exBreakMode = exception.breakMode;
 
-        if (exception.path != null)
-        {
-          var paths = exception.path.ToObject<dynamic[]>();
-          var path = paths[0];
-          if (path.names != null)
-          {
-            var names = path.names.ToObject<dynamic[]>();
-            if (names.Length > 0)
-            {
-              exName = names[0];
-            }
-          }
-        }
+        var path = exception.path?[0];
+        if (path.names != null && path.names.Length > 0)
+          exName = path.names[0];
 
         if (exName != null && exBreakMode == "always")
-        {
           m_Catchpoints.Add(m_Session.Breakpoints.AddCatchpoint(exName));
-        }
       }
     }
 
-    public override void Disconnect(Response response, dynamic args)
+    public override void Disconnect(int reqSeq, JToken args)
     {
       lock (m_Lock)
       {
@@ -354,19 +378,43 @@ namespace UnityDebugAdapter
       }
 
       SendOutput("stdout", "UnityDebugAdapter: Disconnected");
-      SendResponse(response);
+      var response = new Response()
+      {
+        command = "disconnect",
+        request_seq = reqSeq,
+        success = true,
+      };
+      SendMessage(response);
+
+      // as per the specification, the debug adapter should terminate itself
+      DebuggerKill();
+      Environment.Exit(0);
     }
 
-    public override void SetFunctionBreakpoints(Response response, dynamic arguments)
+    public override void SetFunctionBreakpoints(int reqSeq, JToken args)
     {
-      var breakpoints = new List<UnityDebugAdapter.Breakpoint>();
-      SendResponse(response, new SetFunctionBreakpointsBody(breakpoints.ToArray()));
+      var breakpoints = new List<Breakpoint>();
+      var response = new Response()
+      {
+        command = "setFunctionBreakpoints",
+        request_seq = reqSeq,
+        success = true,
+        body = new SetFunctionBreakpointsBody(breakpoints.ToArray())
+      };
+      SendMessage(response);
     }
 
-    public override void Continue(Response response, dynamic arguments)
+    public override void Continue(int reqSeq, JToken args)
     {
       WaitForSuspend();
-      SendResponse(response, new ContinueResponseBody());
+      var response = new Response()
+      {
+        command = "continue",
+        request_seq = reqSeq,
+        success = true,
+        body = new ContinueResponseBody()
+      };
+      SendMessage(response);
       lock (m_Lock)
       {
         if (m_Session == null || m_Session.IsRunning || m_Session.HasExited) return;
@@ -376,10 +424,16 @@ namespace UnityDebugAdapter
       }
     }
 
-    public override void Next(Response response, dynamic arguments)
+    public override void Next(int reqSeq, JToken args)
     {
       WaitForSuspend();
-      SendResponse(response);
+      var response = new Response()
+      {
+        command = "next",
+        request_seq = reqSeq,
+        success = true,
+      };
+      SendMessage(response);
       lock (m_Lock)
       {
         if (m_Session == null || m_Session.IsRunning || m_Session.HasExited) return;
@@ -389,10 +443,16 @@ namespace UnityDebugAdapter
       }
     }
 
-    public override void StepIn(Response response, dynamic arguments)
+    public override void StepIn(int reqSeq, JToken args)
     {
       WaitForSuspend();
-      SendResponse(response);
+      var response = new Response()
+      {
+        command = "stepIn",
+        request_seq = reqSeq,
+        success = true,
+      };
+      SendMessage(response);
       lock (m_Lock)
       {
         if (m_Session == null || m_Session.IsRunning || m_Session.HasExited) return;
@@ -402,10 +462,16 @@ namespace UnityDebugAdapter
       }
     }
 
-    public override void StepOut(Response response, dynamic arguments)
+    public override void StepOut(int reqSeq, JToken args)
     {
       WaitForSuspend();
-      SendResponse(response);
+      var response = new Response()
+      {
+        command = "stepOut",
+        request_seq = reqSeq,
+        success = true,
+      };
+      SendMessage(response);
       lock (m_Lock)
       {
         if (m_Session == null || m_Session.IsRunning || m_Session.HasExited) return;
@@ -415,9 +481,15 @@ namespace UnityDebugAdapter
       }
     }
 
-    public override void Pause(Response response, dynamic arguments)
+    public override void Pause(int reqSeq, JToken args)
     {
-      SendResponse(response);
+      var response = new Response()
+      {
+        command = "pause",
+        request_seq = reqSeq,
+        success = true,
+      };
+      SendMessage(response);
       PauseDebugger();
     }
 
@@ -430,16 +502,17 @@ namespace UnityDebugAdapter
       }
     }
 
-    protected override void SetVariable(Response response, object arguments)
+    protected override void SetVariable(int reqSeq, JToken args)
     {
-      var reference = GetInt(arguments, "variablesReference", -1);
+      var reference = (int)args["variablesReference"];
       if (reference == -1)
       {
-        SendErrorResponse(response, 3009, "variables: property 'variablesReference' is missing", null, false, true);
+        SendErrorResponse(reqSeq, "setVariable", 3009, "variables: property 'variablesReference' is missing",
+            null, false, true);
         return;
       }
 
-      var value = GetString(arguments, "value");
+      var value = (string)args["value"];
       if (m_VariableHandles.TryGet(reference, out var children))
       {
         if (children != null && children.Length > 0)
@@ -455,50 +528,71 @@ namespace UnityDebugAdapter
               continue;
             v.WaitHandle.WaitOne();
             var variable = CreateVariable(v);
-            if (variable.name == GetString(arguments, "name"))
+            if (variable.name == (string)args["name"])
             {
               v.Value = value;
-              SendResponse(response, new SetVariablesResponseBody(value, variable.type, variable.variablesReference));
+              var response = new Response()
+              {
+                command = "setVariable",
+                request_seq = reqSeq,
+                success = true,
+                body = new SetVariablesResponseBody(value, variable.type, variable.variablesReference),
+              };
+              SendMessage(response);
             }
           }
         }
       }
     }
 
-    public override void SetExceptionBreakpoints(Response response, dynamic arguments)
+    public override void SetExceptionBreakpoints(int reqSeq, JToken args)
     {
-      SetExceptionBreakpoints(arguments.exceptionOptions);
-      SendResponse(response);
+      var _args = args.ToObject<SetExceptionBreakpointsArguments>();
+      SetExceptionBreakpoints(_args.exceptionOptions);
+      var response = new Response()
+      {
+        command = "setExceptionBreakpoints",
+        request_seq = reqSeq,
+        success = true,
+      };
+      SendMessage(response);
     }
 
-    public override void SetBreakpoints(Response response, dynamic arguments)
+    public override void SetBreakpoints(int reqSeq, JToken args)
     {
       string path = null;
-
-      if (arguments.source != null)
+      var _args = args.ToObject<SetBreakpointsArguments>();
+      var response = new Response()
       {
-        var p = (string)arguments.source.path;
+        command = "setBreakpoints",
+        request_seq = reqSeq,
+        success = true,
+      };
+
+      if (_args.source != null)
+      {
+        var p = _args.source.path;
         if (p != null && p.Trim().Length > 0)
-        {
           path = p;
-        }
       }
 
       if (path == null)
       {
-        SendErrorResponse(response, 3010, "setBreakpoints: property 'source' is empty or misformed", null, false, true);
+        SendErrorResponse(reqSeq, "setBreakpoints", 3010, "setBreakpoints: property 'source' is empty or misformed",
+            null, false, true);
         return;
       }
 
       if (!HasMonoExtension(path))
       {
         // we only support breakpoints in files mono can handle
-        SendResponse(response, new SetBreakpointsResponseBody());
+        response.body = new SetBreakpointsResponseBody();
+        SendMessage(response);
         return;
       }
 
-      SourceBreakpoint[] newBreakpoints = getBreakpoints(arguments, "breakpoints");
-      bool sourceModified = (bool)arguments.sourceModified;
+      SourceBreakpoint[] newBreakpoints = _args.breakpoints ?? Array.Empty<SourceBreakpoint>();
+      bool sourceModified = _args.sourceModified ?? false;
       var lines = newBreakpoints.Select(bp => bp.line);
 
       Dictionary<int, Mono.Debugging.Client.Breakpoint> dictionary = null;
@@ -523,7 +617,7 @@ namespace UnityDebugAdapter
         m_Breakpoints[path] = dictionary;
       }
 
-      var responseBreakpoints = new List<UnityDebugAdapter.Breakpoint>();
+      var responseBreakpoints = new List<Breakpoint>();
       foreach (var breakpoint in newBreakpoints)
       {
         if (!dictionary.ContainsKey(breakpoint.line))
@@ -538,30 +632,33 @@ namespace UnityDebugAdapter
               bp.TraceExpression = breakpoint.logMessage;
             }
             dictionary[breakpoint.line] = bp;
-            responseBreakpoints.Add(new UnityDebugAdapter.Breakpoint(true, breakpoint.line, breakpoint.column, breakpoint.logMessage));
+            responseBreakpoints.Add(new Breakpoint(true, breakpoint.line, breakpoint.column, breakpoint.logMessage));
           }
           catch (Exception e)
           {
             Logger.LogError($"SetBreakpoints error: msg: {e.Message}, stacktrace: {e.StackTrace}");
-            SendErrorResponse(response, 3011, "setBreakpoints: " + e.Message, null, false, true);
-            responseBreakpoints.Add(new UnityDebugAdapter.Breakpoint(false, breakpoint.line, breakpoint.column, e.Message));
+            SendErrorResponse(reqSeq, "setBreakpoints", 3011, "setBreakpoints: " + e.Message,
+                null, false, true);
+            responseBreakpoints.Add(new Breakpoint(false, breakpoint.line, breakpoint.column, e.Message));
           }
         }
         else
         {
           dictionary[breakpoint.line].ConditionExpression = breakpoint.condition;
-          responseBreakpoints.Add(new UnityDebugAdapter.Breakpoint(true, breakpoint.line, breakpoint.column, breakpoint.logMessage));
+          responseBreakpoints.Add(new Breakpoint(true, breakpoint.line, breakpoint.column, breakpoint.logMessage));
         }
       }
 
-      SendResponse(response, new SetBreakpointsResponseBody(responseBreakpoints));
+      response.body = new SetBreakpointsResponseBody(responseBreakpoints);
+      SendMessage(response);
     }
 
-    public override void StackTrace(Response response, dynamic arguments)
+    public override void StackTrace(int reqSeq, JToken args)
     {
-      int maxLevels = GetInt(arguments, "levels", 10);
-      int startFrame = GetInt(arguments, "startFrame", 0);
-      int threadReference = GetInt(arguments, "threadId", 0);
+      var _args = args.ToObject<StackTraceArguments>();
+      int maxLevels = _args.levels ?? 10;
+      int startFrame = _args.startFrame ?? 0;
+      int threadReference = _args.threadId;
 
       WaitForSuspend();
 
@@ -570,13 +667,10 @@ namespace UnityDebugAdapter
       {
         // Console.Error.WriteLine("stackTrace: unexpected: active thread should be the one requested");
         thread = FindThread(threadReference);
-        if (thread != null)
-        {
-          thread.SetActive();
-        }
+        thread?.SetActive();
       }
 
-      var stackFrames = new List<UnityDebugAdapter.StackFrame>();
+      var stackFrames = new List<StackFrame>();
       var totalFrames = 0;
 
       var bt = thread.Backtrace;
@@ -612,11 +706,18 @@ namespace UnityDebugAdapter
           var frameHandle = m_FrameHandles.Create(frame);
           string name = frame.SourceLocation.MethodName;
           int line = frame.SourceLocation.Line;
-          stackFrames.Add(new UnityDebugAdapter.StackFrame(frameHandle, name, source, ConvertDebuggerLineToClient(line), 0, hint));
+          stackFrames.Add(new StackFrame(frameHandle, name, source, ConvertDebuggerLineToClient(line), 0, hint));
         }
       }
 
-      SendResponse(response, new StackTraceResponseBody(stackFrames, totalFrames));
+      var response = new Response()
+      {
+        command = "stackTrace",
+        request_seq = reqSeq,
+        success = true,
+        body = new StackTraceResponseBody(stackFrames, totalFrames),
+      };
+      SendMessage(response);
     }
 
     ThreadInfo DebuggerActiveThread()
@@ -627,14 +728,16 @@ namespace UnityDebugAdapter
       }
     }
 
-    public override void Source(Response response, dynamic arguments)
+    public override void Source(int reqSeq, JToken args)
     {
-      SendErrorResponse(response, 1020, "No source available");
+      SendErrorResponse(reqSeq, "source", 1020, "No source available");
     }
 
-    public override void Scopes(Response response, dynamic args)
+    public override void Scopes(int reqSeq, JToken args)
     {
-      int frameId = GetInt(args, "frameId", 0);
+      var _args = args.ToObject<ScopesArguments>();
+
+      int frameId = _args.frameId;
       var frame = m_FrameHandles.Get(frameId, null);
 
       var scopes = new List<Scope>();
@@ -650,15 +753,24 @@ namespace UnityDebugAdapter
         scopes.Add(new Scope("Local", m_VariableHandles.Create(locals)));
       }
 
-      SendResponse(response, new ScopesResponseBody(scopes));
+      var response = new Response()
+      {
+        command = "scopes",
+        request_seq = reqSeq,
+        success = true,
+        body = new ScopesResponseBody(scopes),
+      };
+      SendMessage(response);
     }
 
-    public override void Variables(Response response, dynamic args)
+    public override void Variables(int reqSeq, JToken args)
     {
-      int reference = GetInt(args, "variablesReference", -1);
+      var _args = args.ToObject<VariablesArguments>();
+      int reference = _args.variablesReference;
       if (reference == -1)
       {
-        SendErrorResponse(response, 3009, "variables: property 'variablesReference' is missing", null, false, true);
+        SendErrorResponse(reqSeq, "variables", 3009,
+            "variables: property 'variablesReference' is missing", null, false, true);
         return;
       }
 
@@ -700,10 +812,18 @@ namespace UnityDebugAdapter
         }
       }
 
-      SendResponse(response, new VariablesResponseBody(variables));
+
+      var response = new Response()
+      {
+        command = "variables",
+        request_seq = reqSeq,
+        success = true,
+        body = new VariablesResponseBody(variables),
+      };
+      SendMessage(response);
     }
 
-    public override void Threads(Response response, dynamic args)
+    public override void Threads(int reqSeq, JToken args)
     {
       var threads = new List<Thread>();
       var process = m_ActiveProcess;
@@ -724,32 +844,50 @@ namespace UnityDebugAdapter
         threads = d.Values.ToList();
       }
 
-      SendResponse(response, new ThreadsResponseBody(threads));
+      var response = new Response()
+      {
+        command = "threads",
+        request_seq = reqSeq,
+        success = true,
+        body = new ThreadsResponseBody(threads),
+      };
+      SendMessage(response);
     }
 
-    public override void Evaluate(Response response, dynamic args)
+    public override void Evaluate(int reqSeq, JToken args)
     {
-      var expression = GetString(args, "expression");
-      var frameId = GetInt(args, "frameId", 0);
+      var _args = args.ToObject<EvaluateArguments>();
+      var expression = _args.expression;
+      var frameId = _args.frameId ?? 0;
 
       if (expression == null)
       {
-        SendError(response, "expression missing");
+        SendErrorResponse(reqSeq, "evaluate", 3014, "Evaluate request failed ({_reason}).",
+            new Dictionary<string, string> { { "_reason", "expression missing" } });
         return;
       }
 
       var frame = m_FrameHandles.Get(frameId, null);
       if (frame == null)
       {
-        SendError(response, "no active stackframe");
+        SendErrorResponse(reqSeq, "evaluate", 3014, "Evaluate request failed ({_reason}).",
+            new Dictionary<string, string> { { "_reason", "no active stackframe" } });
         return;
       }
 
       if (!frame.ValidateExpression(expression))
       {
-        SendError(response, "invalid expression");
+        SendErrorResponse(reqSeq, "evaluate", 3014, "Evaluate request failed ({_reason}).",
+            new Dictionary<string, string> { { "_reason", "invalid expression" } });
         return;
       }
+
+      var response = new Response()
+      {
+        command = "evaluate",
+        request_seq = reqSeq,
+        success = true,
+      };
 
       var evaluationOptions = m_DebuggerSessionOptions.EvaluationOptions.Clone();
       evaluationOptions.EllipsizeStrings = false;
@@ -766,19 +904,22 @@ namespace UnityDebugAdapter
           error = "not available";
         }
 
-        SendResponse(response, new EvaluateResponseBody(error));
+        response.body = new EvaluateResponseBody(error);
+        SendMessage(response);
         return;
       }
 
       if (flags.HasFlag(ObjectValueFlags.Unknown))
       {
-        SendResponse(response, new EvaluateResponseBody("invalid expression"));
+        response.body = new EvaluateResponseBody("invalid expression");
+        SendMessage(response);
         return;
       }
 
       if (flags.HasFlag(ObjectValueFlags.Object) && flags.HasFlag(ObjectValueFlags.Namespace))
       {
-        SendResponse(response, new EvaluateResponseBody("not available"));
+        response.body = new EvaluateResponseBody("not available");
+        SendMessage(response);
         return;
       }
 
@@ -788,13 +929,10 @@ namespace UnityDebugAdapter
         handle = m_VariableHandles.Create(val.GetAllChildren());
       }
 
-      SendResponse(response, new EvaluateResponseBody(val.DisplayValue, handle));
+      response.body = new EvaluateResponseBody(val.DisplayValue, handle);
+      SendMessage(response);
     }
 
-    void SendError(Response response, string error)
-    {
-      SendErrorResponse(response, 3014, "Evaluate request failed ({_reason}).", new { _reason = error });
-    }
 
     //---- private ------------------------------------------
 
@@ -868,7 +1006,7 @@ namespace UnityDebugAdapter
     Backtrace DebuggerActiveBacktrace()
     {
       var thr = DebuggerActiveThread();
-      return thr == null ? null : thr.Backtrace;
+      return thr?.Backtrace;
     }
 
     ExceptionInfo DebuggerActiveException()
@@ -880,48 +1018,6 @@ namespace UnityDebugAdapter
     bool HasMonoExtension(string path)
     {
       return MONO_EXTENSIONS.Any(path.EndsWith);
-    }
-
-    static int GetInt(dynamic args, string property, int dflt = 0)
-    {
-      try
-      {
-        return (int)args[property];
-      }
-      catch (Exception)
-      {
-        // this happens so often that it fills up the log fast => hence the LogDebug and not LogWarn
-        Logger.LogDebug($"could not GetInt from dynamic container: {JsonConvert.SerializeObject(args)} at property: {property}");
-        // ignore and return default value
-      }
-
-      return dflt;
-    }
-
-    static string GetString(dynamic args, string property, string dflt = null)
-    {
-      var s = (string)args[property];
-      if (s == null)
-      {
-        // this happens so often that it fills up the log fast => hence the LogDebug and not LogWarn
-        Logger.LogDebug($"could not GetString from dynamic args: {JsonConvert.SerializeObject(args)} at property: {property}");
-        return dflt;
-      }
-
-      s = s.Trim();
-      if (s.Length == 0)
-      {
-        return dflt;
-      }
-
-      return s;
-    }
-
-    static SourceBreakpoint[] getBreakpoints(dynamic args, string property)
-    {
-      JArray jsonBreakpoints = args[property];
-      var breakpoints = jsonBreakpoints.ToObject<SourceBreakpoint[]>();
-      return breakpoints ?? new SourceBreakpoint[0];
     }
 
     void DebuggerKill()
