@@ -16,6 +16,7 @@ namespace UnityDebugAdapter
   {
     protected static readonly int BUFFER_SIZE = 4096;
     protected static Regex CONTENT_LENGTH_MATCHER = new Regex(@"Content-Length: (\d+)\r\n\r\n");
+    private static readonly byte[] HEADER_DELIMITER = Encoding.ASCII.GetBytes("\r\n\r\n");
 
     private int _sequenceNumber = 1;
     // TODO: use concurrent Dictionary instead...
@@ -112,25 +113,28 @@ namespace UnityDebugAdapter
         }
         else // (_bodyLength == -1) means we got a new message (i.e., a message with Content-Length: (\d+): \r\n\r\n{body})
         {
-          string s = _rawData.GetString();
+          var headerEnd = _rawData.IndexOf(HEADER_DELIMITER);
 
-          if (string.IsNullOrWhiteSpace(s))
+          if (headerEnd < 0)
           {
-            _rawData.RemoveFirst(s.Length);
+            string s = _rawData.GetString();
+            if (string.IsNullOrWhiteSpace(s))
+              _rawData.RemoveFirst(_rawData.Length);
             break;
           }
 
-          Match m = CONTENT_LENGTH_MATCHER.Match(s);
+          var headerBytes = _rawData.RemoveFirst(headerEnd + HEADER_DELIMITER.Length);
+          string header = Encoding.ASCII.GetString(headerBytes);
+          Match m = CONTENT_LENGTH_MATCHER.Match(header);
           if (m.Success && m.Groups.Count == 2)
           {
             _bodyLength = Convert.ToInt32(m.Groups[1].ToString());
-            _rawData.RemoveFirst(m.Index + "Content-Length: ".Length + m.Groups[1].Length + 4);
             continue; // try to handle a complete message
           }
           else
           {
             // TODO: do proper exit strategy here
-            Logger.LogWarn(@"could not regex 'Content-Length: (\d+)' in: {0}", s);
+            Logger.LogWarn(@"could not regex 'Content-Length: (\d+)' in: {0}", header);
           }
         }
 
@@ -256,6 +260,29 @@ namespace UnityDebugAdapter
       Buffer.BlockCopy(_buffer, n, newBuffer, 0, _buffer.Length - n);
       _buffer = newBuffer;
       return b;
+    }
+
+    public int IndexOf(byte[] marker)
+    {
+      if (marker == null || marker.Length == 0 || _buffer.Length < marker.Length)
+        return -1;
+
+      for (var i = 0; i <= _buffer.Length - marker.Length; i++)
+      {
+        var match = true;
+        for (var j = 0; j < marker.Length; j++)
+        {
+          if (_buffer[i + j] != marker[j])
+          {
+            match = false;
+            break;
+          }
+        }
+        if (match)
+          return i;
+      }
+
+      return -1;
     }
   }
 }

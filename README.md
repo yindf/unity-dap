@@ -66,6 +66,63 @@ You should then get an output like this:
 21/08/2025 00:31:01 [I] done constructing UnityDebugSession
 ```
 
+## MCP Mode for LLM Debugging
+
+The same executable can also run as a stdio MCP server. This keeps the MCP
+entry point and the DAP implementation in one binary:
+
+```bash
+bin/Release/unity-debug-adapter.exe --mcp --log-level=info
+```
+
+Example MCP client configuration:
+
+```json
+{
+  "mcpServers": {
+    "unity-debug": {
+      "command": "C:\\path\\to\\unity-dap\\bin\\Release\\unity-debug-adapter.exe",
+      "args": ["--mcp", "--log-level=info"]
+    }
+  }
+}
+```
+
+The MCP server starts a child instance of this executable in normal DAP mode
+for each debug session. This avoids mixing MCP and DAP messages on one
+stdin/stdout stream, and it isolates adapter shutdown from the MCP server.
+
+Available tools:
+
+- `unity_debug_run_flow`: bounded one-shot flow for LLMs. It starts or attaches
+  Unity, sets breakpoints, waits for stopped events with timeouts, captures
+  stack/scopes/variables/evaluations, continues between stops, then disconnects
+  by default.
+- `unity_debug_start`, `unity_debug_set_breakpoints`,
+  `unity_debug_wait_stopped`, `unity_debug_snapshot`,
+  `unity_debug_continue`, `unity_debug_disconnect`: interactive step-by-step
+  debugging.
+- `unity_debug_status` and `unity_debug_cleanup`: inspect and force cleanup
+  sessions if a client is interrupted.
+
+For the repository E2E fixture, a minimal one-shot tool call can use:
+
+```json
+{
+  "name": "unity_debug_run_flow",
+  "arguments": {
+    "lines": [22, 26],
+    "stopCount": 2,
+    "expressions": ["this", "m_Radius", "s_StaticBoolVar", "transform.position"]
+  }
+}
+```
+
+When Unity Hub's licensing helper is holding Unity's licensing mutex, pass
+`"killUnityHubLicensing": true`. This kills `Unity Hub` and
+`Unity.Licensing.Client`, so use it only when the editor exits during startup
+with a licensing conflict.
+
 ## For Developers
 
 This section is mainly for developers interested in contributing or want to

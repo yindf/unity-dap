@@ -17,7 +17,7 @@ public class TestScript : MonoBehaviour
   // Update is called once per frame
   void Update()
   {
-    if (s_StaticBoolVar)
+    if (Time.timeSinceLevelLoad < 8.0f) return; if (s_StaticBoolVar)
     {
       Debug.Log("1ST BREAKPOINT HERE");  // <BREAKPOINT>
       Debug.Log("-------------------");  // <CONTINUE>

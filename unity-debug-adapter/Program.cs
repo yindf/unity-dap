@@ -7,11 +7,16 @@ namespace UnityDebugAdapter
   {
     private static void Main(string[] argv)
     {
+      var mcpMode = false;
+
       // parse command line arguments
       foreach (var a in argv)
       {
         switch (a)
         {
+          case "--mcp":
+            mcpMode = true;
+            break;
           case "--log-level=trace":
             Logger.SetLogLevel(LogLevel.TRACE);
             break;
@@ -41,6 +46,14 @@ namespace UnityDebugAdapter
             }
             break;
         }
+      }
+
+      if (mcpMode)
+      {
+        Logger.LogInfo("waiting for MCP protocol on stdin/stdout");
+        new McpServer().Start();
+        Logger.Disconnect();
+        return;
       }
 
       // stdin/stdout

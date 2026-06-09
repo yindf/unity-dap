@@ -44,6 +44,8 @@ namespace UnityDebugAdapter
     ObjectValue m_Exception;
     readonly Dictionary<int, Thread> m_SeenThreads;
     bool m_Terminated;
+    IPAddress m_AttachAddress;
+    int m_AttachPort;
 
     public UnityDebugSession()
     {
@@ -59,16 +61,28 @@ namespace UnityDebugAdapter
         EvaluationOptions = EvaluationOptions.DefaultOptions
       };
 
+      m_Catchpoints = new List<Catchpoint>();
+      CreateSession();
+
+      Logger.LogInfo("done constructing UnityDebugSession");
+    }
+
+    void CreateSession()
+    {
       m_Session = new UnityDebuggerSession
       {
         Breakpoints = new BreakpointStore()
       };
 
-      m_Catchpoints = new List<Catchpoint>();
-
       m_Session.ExceptionHandler = ex =>
       {
         return true;
+      };
+
+      m_Session.BreakpointTraceHandler = (breakEvent, trace) =>
+      {
+        if (!string.IsNullOrEmpty(trace))
+          SendOutput("stdout", trace.EndsWith(Environment.NewLine) ? trace : trace + Environment.NewLine);
       };
 
       // these are commented because they absolutely flood the REPL for front-end DAP clients
@@ -85,6 +99,7 @@ namespace UnityDebugAdapter
 
       m_Session.TargetStopped += (sender, e) =>
       {
+        Logger.LogInfo("UnityDebugSession: TargetStopped");
         if (e.Backtrace != null)
         {
           Frame = e.Backtrace.GetFrame(0);
@@ -101,6 +116,7 @@ namespace UnityDebugAdapter
 
       m_Session.TargetHitBreakpoint += (sender, e) =>
       {
+        Logger.LogInfo("UnityDebugSession: TargetHitBreakpoint");
         Frame = e.Backtrace.GetFrame(0);
         Stopped();
         SendEvent(CreateStoppedEvent("breakpoint", e.Thread));
@@ -145,15 +161,26 @@ namespace UnityDebugAdapter
 
       m_Session.TargetStarted += (sender, e) =>
       {
+        Logger.LogInfo("UnityDebugSession: TargetStarted");
       };
 
       m_Session.TargetReady += (sender, e) =>
       {
-        m_ActiveProcess = m_Session.GetProcesses().SingleOrDefault();
+        Logger.LogInfo("UnityDebugSession: TargetReady");
+        SendOutput("stdout", "UnityDebugAdapter: target ready");
+        try
+        {
+          m_ActiveProcess = m_Session.GetProcesses()?.SingleOrDefault();
+        }
+        catch (Exception ex)
+        {
+          Logger.LogError("UnityDebugSession: failed to read process info on TargetReady: " + ex);
+        }
       };
 
       m_Session.TargetExited += (sender, e) =>
       {
+        Logger.LogInfo("UnityDebugSession: TargetExited");
         DebuggerKill();
 
         Terminate("target exited");
@@ -163,10 +190,14 @@ namespace UnityDebugAdapter
 
       m_Session.TargetInterrupted += (sender, e) =>
       {
+        Logger.LogInfo("UnityDebugSession: TargetInterrupted");
         m_ResumeEvent.Set();
       };
 
-      m_Session.TargetEvent += (sender, e) => { };
+      m_Session.TargetEvent += (sender, e) =>
+      {
+        Logger.LogInfo($"UnityDebugSession: TargetEvent {e.Type}");
+      };
 
       m_Session.TargetThreadStarted += (sender, e) =>
       {
@@ -189,8 +220,6 @@ namespace UnityDebugAdapter
 
         SendEvent(new ThreadEvent("exited", tid));
       };
-
-      Logger.LogInfo("done constructing UnityDebugSession");
     }
 
     public Mono.Debugging.Client.StackFrame Frame { get; set; }
@@ -594,6 +623,14 @@ namespace UnityDebugAdapter
       SourceBreakpoint[] newBreakpoints = _args.breakpoints ?? Array.Empty<SourceBreakpoint>();
       bool sourceModified = _args.sourceModified ?? false;
       var lines = newBreakpoints.Select(bp => bp.line);
+      Logger.LogInfo(
+          "UnityDebugSession: SetBreakpoints path={0}, lines=[{1}], sourceModified={2}, connected={3}, running={4}, exited={5}",
+          path,
+          string.Join(",", lines),
+          sourceModified,
+          m_Session?.IsConnected ?? false,
+          m_Session?.IsRunning ?? false,
+          m_Session?.HasExited ?? false);
 
       Dictionary<int, Mono.Debugging.Client.Breakpoint> dictionary = null;
       if (m_Breakpoints.ContainsKey(path))
@@ -620,32 +657,32 @@ namespace UnityDebugAdapter
       var responseBreakpoints = new List<Breakpoint>();
       foreach (var breakpoint in newBreakpoints)
       {
-        if (!dictionary.ContainsKey(breakpoint.line))
+        if (dictionary.TryGetValue(breakpoint.line, out var existingBreakpoint))
         {
-          try
-          {
-            var bp = m_Session.Breakpoints.Add(path, breakpoint.line);
-            bp.ConditionExpression = breakpoint.condition;
-            if (!string.IsNullOrEmpty(breakpoint.logMessage))
-            {
-              bp.HitAction = HitAction.PrintExpression;
-              bp.TraceExpression = breakpoint.logMessage;
-            }
-            dictionary[breakpoint.line] = bp;
-            responseBreakpoints.Add(new Breakpoint(true, breakpoint.line, breakpoint.column, breakpoint.logMessage));
-          }
-          catch (Exception e)
-          {
-            Logger.LogError($"SetBreakpoints error: msg: {e.Message}, stacktrace: {e.StackTrace}");
-            SendErrorResponse(reqSeq, "setBreakpoints", 3011, "setBreakpoints: " + e.Message,
-                null, false, true);
-            responseBreakpoints.Add(new Breakpoint(false, breakpoint.line, breakpoint.column, e.Message));
-          }
+          m_Session.Breakpoints.Remove(existingBreakpoint);
+          dictionary.Remove(breakpoint.line);
         }
-        else
+
+        try
         {
-          dictionary[breakpoint.line].ConditionExpression = breakpoint.condition;
+          var bp = m_Session.Breakpoints.Add(path, breakpoint.line);
+          bp.ConditionExpression = breakpoint.condition;
+          if (!string.IsNullOrWhiteSpace(breakpoint.hitCondition))
+            ApplyHitCondition(bp, breakpoint.hitCondition);
+          if (!string.IsNullOrEmpty(breakpoint.logMessage))
+          {
+            bp.HitAction = HitAction.PrintExpression;
+            bp.TraceExpression = breakpoint.logMessage;
+          }
+          dictionary[breakpoint.line] = bp;
           responseBreakpoints.Add(new Breakpoint(true, breakpoint.line, breakpoint.column, breakpoint.logMessage));
+        }
+        catch (Exception e)
+        {
+          Logger.LogError($"SetBreakpoints error: msg: {e.Message}, stacktrace: {e.StackTrace}");
+          SendErrorResponse(reqSeq, "setBreakpoints", 3011, "setBreakpoints: " + e.Message,
+              null, false, true);
+          responseBreakpoints.Add(new Breakpoint(false, breakpoint.line, breakpoint.column, e.Message));
         }
       }
 
@@ -1018,6 +1055,52 @@ namespace UnityDebugAdapter
     bool HasMonoExtension(string path)
     {
       return MONO_EXTENSIONS.Any(path.EndsWith);
+    }
+
+    static void ApplyHitCondition(Mono.Debugging.Client.Breakpoint breakpoint, string hitCondition)
+    {
+      var text = hitCondition.Trim();
+      if (string.IsNullOrEmpty(text))
+        return;
+
+      var mode = HitCountMode.EqualTo;
+      string numberText = text;
+      if (text.StartsWith(">=", StringComparison.Ordinal))
+      {
+        mode = HitCountMode.GreaterThanOrEqualTo;
+        numberText = text.Substring(2);
+      }
+      else if (text.StartsWith("<=", StringComparison.Ordinal))
+      {
+        mode = HitCountMode.LessThanOrEqualTo;
+        numberText = text.Substring(2);
+      }
+      else if (text.StartsWith("==", StringComparison.Ordinal))
+      {
+        mode = HitCountMode.EqualTo;
+        numberText = text.Substring(2);
+      }
+      else if (text.StartsWith(">", StringComparison.Ordinal))
+      {
+        mode = HitCountMode.GreaterThan;
+        numberText = text.Substring(1);
+      }
+      else if (text.StartsWith("<", StringComparison.Ordinal))
+      {
+        mode = HitCountMode.LessThan;
+        numberText = text.Substring(1);
+      }
+      else if (text.StartsWith("%", StringComparison.Ordinal))
+      {
+        mode = HitCountMode.MultipleOf;
+        numberText = text.Substring(1);
+      }
+
+      if (!int.TryParse(numberText.Trim(), out var hitCount) || hitCount <= 0)
+        throw new InvalidOperationException("hitCondition must be a positive integer with optional operator ==, >=, >, <=, <, or %");
+
+      breakpoint.HitCountMode = mode;
+      breakpoint.HitCount = hitCount;
     }
 
     void DebuggerKill()
