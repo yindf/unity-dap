@@ -68,8 +68,9 @@ You should then get an output like this:
 
 ## MCP Mode for LLM Debugging
 
-The same executable can also run as a stdio MCP server. This keeps the MCP
-entry point and the DAP implementation in one binary:
+The same executable can also run as a stdio MCP server. This lets an MCP client
+or LLM agent start Unity, attach to a running Editor, set breakpoints, control
+Play Mode, and inspect stopped frames through the same debug adapter binary:
 
 ```bash
 bin/Release/unity-debug-adapter.exe --mcp --log-level=info
@@ -91,28 +92,50 @@ Example MCP client configuration:
 The MCP server starts a child instance of this executable in normal DAP mode
 for each debug session. This avoids mixing MCP and DAP messages on one
 stdin/stdout stream, and it isolates adapter shutdown from the MCP server.
+Session logs are written under `bin/Release/mcp-logs/<sessionId>/`.
 
 Available tools:
 
-- `unity_debug_run_flow`: bounded one-shot flow for LLMs. It starts or attaches
-  Unity, sets breakpoints, waits for stopped events with timeouts, captures
-  stack/scopes/variables/evaluations, continues between stops, then disconnects
-  by default.
-- `unity_debug_start`, `unity_debug_set_breakpoints`,
-  `unity_debug_wait_stopped`, `unity_debug_snapshot`,
-  `unity_debug_continue`, `unity_debug_disconnect`: interactive step-by-step
-  debugging.
-- `unity_debug_status` and `unity_debug_cleanup`: inspect and force cleanup
-  sessions if a client is interrupted.
+- `unity_debug_session`: create, attach, detach, disconnect, reset, or clean up
+  debug sessions. `attach` can use an explicit `unityPid`, reuse the active
+  Unity process, or auto-select a single running Unity Editor for the project.
+- `unity_debug_breakpoints`: set, add, remove, update, clear, or list source
+  breakpoints. Breakpoint specs support lines, conditions, hit conditions, and
+  log messages.
+- `unity_debug_control`: enter Play Mode, wait for stopped events, capture
+  stack/scope/variable snapshots, continue, step, pause, or run Unity tests.
+- `unity_debug_status`: inspect session state, breakpoints, or diagnostic log
+  tails.
 
-For the repository E2E fixture, a minimal one-shot tool call can use:
+For the repository E2E fixture, a minimal interactive flow is:
+
+```json
+{ "name": "unity_debug_session", "arguments": { "action": "attach" } }
+```
 
 ```json
 {
-  "name": "unity_debug_run_flow",
+  "name": "unity_debug_breakpoints",
   "arguments": {
-    "lines": [22, 26],
-    "stopCount": 2,
+    "action": "set",
+    "breakpoints": [{ "line": 22 }]
+  }
+}
+```
+
+```json
+{ "name": "unity_debug_control", "arguments": { "action": "enterPlay" } }
+```
+
+```json
+{ "name": "unity_debug_control", "arguments": { "action": "wait" } }
+```
+
+```json
+{
+  "name": "unity_debug_control",
+  "arguments": {
+    "action": "snapshot",
     "expressions": ["this", "m_Radius", "s_StaticBoolVar", "transform.position"]
   }
 }
