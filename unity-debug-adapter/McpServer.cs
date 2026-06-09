@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using Newtonsoft.Json;
@@ -106,137 +107,55 @@ namespace UnityDebugAdapter
       {
         ["tools"] = new JArray
         {
-          Tool("unity_debug_start", "Start a Unity Editor process, then initialize and attach the DAP adapter.",
+          Tool("unity_debug_session", "Start, attach, prepare, disconnect, or clean up Unity debug sessions.",
               Obj(
+                Prop("action", "string", "start, attach, prepare, disconnect, cleanup. Default prepare."),
                 Prop("projectPath", "string", "Unity project path. Defaults to the repository E2E fixture."),
                 Prop("sourcePath", "string", "Default source file path for later breakpoint requests."),
                 Prop("unityExe", "string", "Unity.exe path. Defaults to latest Unity Hub 2022.3 editor."),
-                Prop("startupTimeoutSeconds", "number", "Attach retry timeout. Default 90."),
-                Prop("requestTimeoutSeconds", "number", "DAP request timeout. Default 15."),
-                Prop("killUnityHubLicensing", "boolean", "Stop Unity Hub and Unity.Licensing.Client before starting Unity. Use when licensing mutex blocks the editor.")
-              )),
-          Tool("unity_debug_attach", "Attach to an existing Unity Editor process, then initialize and attach the DAP adapter.",
-              Obj(
-                Required("unityPid", "integer", "Existing Unity Editor process id."),
-                Prop("projectPath", "string", "Unity project path. Defaults to the repository E2E fixture."),
-                Prop("sourcePath", "string", "Default source file path for later breakpoint requests."),
-                Prop("startupTimeoutSeconds", "number", "Attach retry timeout. Default 90."),
-                Prop("requestTimeoutSeconds", "number", "DAP request timeout. Default 15.")
-              )),
-          Tool("unity_debug_run_flow", "Run a bounded attach, breakpoint, stopped-event, snapshot, continue, and disconnect flow.",
-              Obj(
-                Prop("projectPath", "string", "Unity project path. Defaults to the repository E2E fixture."),
-                Prop("sourcePath", "string", "Source file path. Defaults to fixture TestScript.cs."),
-                Prop("unityExe", "string", "Unity.exe path. Defaults to latest Unity Hub 2022.3 editor."),
-                Prop("unityPid", "integer", "Attach an existing Unity Editor process instead of starting one."),
-                Prop("lines", "array", "Breakpoint lines. Defaults to 22 and 26 for the fixture."),
-                ArrayProp("expressions", "string", "Expressions to evaluate at each stop."),
-                Prop("stopCount", "integer", "Number of stopped events to collect. Default 2."),
-                Prop("startupTimeoutSeconds", "number", "Attach retry timeout. Default 90."),
-                Prop("stopTimeoutSeconds", "number", "Stopped-event timeout. Default 60."),
-                Prop("requestTimeoutSeconds", "number", "DAP request timeout. Default 15."),
-                Prop("disconnectOnComplete", "boolean", "Disconnect and close Unity at the end. Default true."),
-                Prop("killUnityHubLicensing", "boolean", "Stop Unity Hub and Unity.Licensing.Client before starting Unity. Use when licensing mutex blocks the editor.")
-              )),
-          Tool("unity_debug_prepare", "Start or attach, make the session active, and optionally set breakpoints.",
-              Obj(
-                Prop("projectPath", "string", "Unity project path. Defaults to the repository E2E fixture."),
-                Prop("sourcePath", "string", "Default source file path for later breakpoint requests."),
-                Prop("unityExe", "string", "Unity.exe path. Defaults to latest Unity Hub 2022.3 editor."),
-                Prop("unityPid", "integer", "Attach an existing Unity Editor process instead of starting one."),
+                Prop("unityPid", "integer", "Existing Unity Editor process id for attach/prepare."),
+                Prop("sessionId", "string", "Session id. Defaults to the active session."),
                 Prop("lines", "array", "Breakpoint lines. Kept for compatibility; use breakpoints for conditions/logpoints."),
                 BreakpointsProp("breakpoints", "Breakpoint specs: { line, column, condition, hitCondition, logMessage }."),
                 Prop("startupTimeoutSeconds", "number", "Attach retry timeout. Default 90."),
+                Prop("readyTimeoutSeconds", "number", "Target-ready wait after attach succeeds. Default 10."),
                 Prop("requestTimeoutSeconds", "number", "DAP request timeout. Default 15."),
                 Prop("killUnityHubLicensing", "boolean", "Stop Unity Hub and Unity.Licensing.Client before starting Unity. Use when licensing mutex blocks the editor."),
                 Prop("setExceptionBreakpoints", "boolean", "Also send an empty setExceptionBreakpoints request. Default false.")
               )),
-          Tool("unity_debug_enter_play_and_stop", "Enter Play Mode, wait for a stopped event, and return a snapshot.",
+          Tool("unity_debug_breakpoints", "Set, add, remove, update, clear, or list source breakpoints.",
               Obj(
+                Prop("action", "string", "set, add, remove, update, clear, list. Default set."),
                 Prop("sessionId", "string", "Session id. Defaults to the active session."),
-                Prop("projectPath", "string", "Unity project path. Defaults to the session project path."),
-                Prop("timeoutSeconds", "number", "Stopped-event timeout. Default 60."),
-                ArrayProp("expressions", "string", "Expressions to evaluate in the snapshot.")
-              )),
-          Tool("unity_debug_resume_until_stopped", "Continue, wait for the next stopped event, and return a snapshot.",
-              Obj(
-                Prop("sessionId", "string", "Session id. Defaults to the active session."),
-                Prop("threadId", "integer", "Thread id. Defaults to current stopped thread."),
-                Prop("timeoutSeconds", "number", "Stopped-event timeout. Default 60."),
-                ArrayProp("expressions", "string", "Expressions to evaluate in the snapshot.")
-              )),
-          Tool("unity_debug_diagnose", "Return status plus recent adapter/transcript log tail for a session.",
-              Obj(
-                Prop("sessionId", "string", "Session id. Defaults to the active session."),
-                Prop("tailLines", "integer", "Number of log lines to return. Default 80.")
-              )),
-          Tool("unity_debug_set_breakpoints", "Set source breakpoints in the active Unity debug session.",
-              Obj(
-                Prop("sessionId", "string", "Session id returned by unity_debug_start or unity_debug_attach. Defaults to the active session."),
                 Prop("sourcePath", "string", "Source file path. Defaults to fixture TestScript.cs."),
                 Prop("lines", "array", "Breakpoint lines."),
-                BreakpointsProp("breakpoints", "Breakpoint specs: { line, column, condition, hitCondition, logMessage }.")
+                BreakpointsProp("breakpoints", "Breakpoint specs: { line, column, condition, hitCondition, logMessage }."),
+                Prop("oldLine", "integer", "Existing breakpoint line for update."),
+                Prop("newLine", "integer", "New breakpoint line for update."),
+                Prop("condition", "string", "Condition expression for update."),
+                Prop("hitCondition", "string", "Hit condition for update."),
+                Prop("logMessage", "string", "Logpoint message/expression for update.")
               )),
-          Tool("unity_debug_add_breakpoints", "Add source breakpoints and synchronize the full source breakpoint set to the debug session.",
+          Tool("unity_debug_control", "Control execution: enter play, run tests, wait, snapshot, continue, next, step in/out, pause.",
               Obj(
-                Prop("sessionId", "string", "Session id returned by unity_debug_start or unity_debug_attach. Defaults to the active session."),
-                Prop("sourcePath", "string", "Source file path. Defaults to fixture TestScript.cs."),
-                Prop("lines", "array", "Breakpoint lines to add."),
-                BreakpointsProp("breakpoints", "Breakpoint specs to add: { line, column, condition, hitCondition, logMessage }.")
-              )),
-          Tool("unity_debug_remove_breakpoints", "Remove source breakpoints and synchronize the full source breakpoint set to the debug session.",
-              Obj(
-                Prop("sessionId", "string", "Session id returned by unity_debug_start or unity_debug_attach. Defaults to the active session."),
-                Prop("sourcePath", "string", "Source file path. Defaults to fixture TestScript.cs."),
-                Required("lines", "array", "Breakpoint lines to remove.")
-              )),
-          Tool("unity_debug_update_breakpoint", "Update one source breakpoint line and synchronize the full source breakpoint set to the debug session.",
-              Obj(
-                Prop("sessionId", "string", "Session id returned by unity_debug_start or unity_debug_attach. Defaults to the active session."),
-                Prop("sourcePath", "string", "Source file path. Defaults to fixture TestScript.cs."),
-                Required("oldLine", "integer", "Existing breakpoint line to replace."),
-                Required("newLine", "integer", "New breakpoint line."),
-                Prop("condition", "string", "Optional condition expression for the updated breakpoint."),
-                Prop("hitCondition", "string", "Optional hit condition for the updated breakpoint."),
-                Prop("logMessage", "string", "Optional logpoint message/expression for the updated breakpoint.")
-              )),
-          Tool("unity_debug_clear_breakpoints", "Clear breakpoints for one source, or for all tracked sources when sourcePath is omitted.",
-              Obj(
-                Prop("sessionId", "string", "Session id returned by unity_debug_start or unity_debug_attach. Defaults to the active session."),
-                Prop("sourcePath", "string", "Source file path. Defaults to all tracked sources.")
-              )),
-          Tool("unity_debug_list_breakpoints", "List breakpoints currently tracked by this MCP debug session.",
-              Obj(
-                Prop("sessionId", "string", "Session id returned by unity_debug_start or unity_debug_attach. Defaults to the active session."),
-                Prop("sourcePath", "string", "Optional source path filter.")
-              )),
-          Tool("unity_debug_enter_play_mode", "Ask the Unity Editor project for this session to enter Play Mode.",
-              Obj(
+                Prop("action", "string", "enterPlay, enterPlayAndStop, runTests, wait, snapshot, continue, next, stepIn, stepOut, pause, resumeUntilStopped. Default resumeUntilStopped."),
                 Prop("sessionId", "string", "Session id. Defaults to the active session."),
-                Prop("projectPath", "string", "Unity project path. Defaults to the session project path.")
+                Prop("projectPath", "string", "Unity project path. Defaults to the session project path."),
+                Prop("threadId", "integer", "Thread id. Defaults to current stopped thread."),
+                Prop("timeoutSeconds", "number", "Stopped-event timeout. Default 60."),
+                Prop("controlPort", "integer", "Unity MCP control port. Defaults to 57000 + unityPid % 1000."),
+                Prop("controlTimeoutSeconds", "number", "Unity MCP control command timeout. Default 15."),
+                ArrayProp("expressions", "string", "Expressions to evaluate in snapshots."),
+                Prop("testMode", "string", "Unity Test Runner mode: EditMode, PlayMode, or All. Default EditMode."),
+                Prop("testFilter", "string", "Optional Unity test name filter.")
               )),
-          Tool("unity_debug_wait_stopped", "Wait for a stopped event with a hard timeout.",
+          Tool("unity_debug_status", "Return status, breakpoints, or diagnostics for the active Unity debug session.",
               Obj(
+                Prop("action", "string", "status, breakpoints, diagnose. Default status."),
                 Prop("sessionId", "string", "Session id. Defaults to the active session."),
-                Prop("timeoutSeconds", "number", "Wait timeout. Default 60.")
-              )),
-          Tool("unity_debug_snapshot", "Read stack, scopes, variables, and evaluate expressions at the current stop.",
-              Obj(
-                Prop("sessionId", "string", "Session id. Defaults to the active session."),
-                Prop("threadId", "integer", "Thread id from stopped event. Defaults to current stopped thread."),
-                ArrayProp("expressions", "string", "Expressions to evaluate. Defaults to this, m_Radius, s_StaticBoolVar, transform.position.")
-              )),
-          Tool("unity_debug_continue", "Continue the stopped Unity debuggee.",
-              Obj(
-                Prop("sessionId", "string", "Session id. Defaults to the active session."),
-                Prop("threadId", "integer", "Thread id. Defaults to current stopped thread.")
-              )),
-          Tool("unity_debug_disconnect", "Disconnect the adapter and clean the session. Safe to call more than once.",
-              Obj(Prop("sessionId", "string", "Session id. Defaults to the active session."))),
-          Tool("unity_debug_status", "Return session status, latest events, and log paths.",
-              Obj(Prop("sessionId", "string", "Session id. Defaults to the active session."))),
-          Tool("unity_debug_cleanup", "Force cleanup a session, or all sessions when no sessionId is provided.",
-              Obj(Prop("sessionId", "string", "Session id.")))
+                Prop("sourcePath", "string", "Optional source path filter for breakpoints."),
+                Prop("tailLines", "integer", "Number of log lines for diagnose. Default 80.")
+              ))
         }
       };
     }
@@ -249,6 +168,15 @@ namespace UnityDebugAdapter
       object result;
       switch (name)
       {
+        case "unity_debug_session":
+          result = ToolSession(args);
+          break;
+        case "unity_debug_breakpoints":
+          result = ToolBreakpoints(args);
+          break;
+        case "unity_debug_control":
+          result = ToolControl(args);
+          break;
         case "unity_debug_start":
           result = ToolStart(args);
           break;
@@ -300,6 +228,22 @@ namespace UnityDebugAdapter
         case "unity_debug_continue":
           result = WithSession(args, s => s.Continue(args));
           break;
+        case "unity_debug_next":
+        case "unity_debug_step_over":
+          result = WithSession(args, s => s.Next(args));
+          break;
+        case "unity_debug_step_in":
+          result = WithSession(args, s => s.StepIn(args));
+          break;
+        case "unity_debug_step_out":
+          result = WithSession(args, s => s.StepOut(args));
+          break;
+        case "unity_debug_pause":
+          result = WithSession(args, s => s.Pause(args));
+          break;
+        case "unity_debug_run_tests":
+          result = WithSession(args, s => s.RunTests(args));
+          break;
         case "unity_debug_disconnect":
           result = WithSession(args, s =>
           {
@@ -311,7 +255,7 @@ namespace UnityDebugAdapter
           });
           break;
         case "unity_debug_status":
-          result = WithSession(args, s => s.Status());
+          result = ToolStatus(args);
           break;
         case "unity_debug_cleanup":
           result = ToolCleanup(args);
@@ -321,6 +265,111 @@ namespace UnityDebugAdapter
       }
 
       return ToolText(result);
+    }
+
+    object ToolSession(JObject args)
+    {
+      var action = NormalizeAction(args, "prepare");
+      switch (action)
+      {
+        case "start":
+          return ToolStart(args);
+        case "attach":
+          return ToolAttach(args);
+        case "prepare":
+          return ToolPrepare(args);
+        case "disconnect":
+          return WithSession(args, s =>
+          {
+            var r = s.Disconnect();
+            m_Sessions.Remove(s.SessionId);
+            if (m_ActiveSessionId == s.SessionId)
+              m_ActiveSessionId = null;
+            return r;
+          });
+        case "cleanup":
+          return ToolCleanup(args);
+        default:
+          throw new InvalidOperationException("Unknown unity_debug_session action: " + action);
+      }
+    }
+
+    object ToolBreakpoints(JObject args)
+    {
+      var action = NormalizeAction(args, "set");
+      switch (action)
+      {
+        case "set":
+          return WithSession(args, s => s.SetBreakpoints(args));
+        case "add":
+          return WithSession(args, s => s.AddBreakpoints(args));
+        case "remove":
+          return WithSession(args, s => s.RemoveBreakpoints(args));
+        case "update":
+          return WithSession(args, s => s.UpdateBreakpoint(args));
+        case "clear":
+          return WithSession(args, s => s.ClearBreakpoints(args));
+        case "list":
+          return WithSession(args, s => s.ListBreakpoints(args));
+        default:
+          throw new InvalidOperationException("Unknown unity_debug_breakpoints action: " + action);
+      }
+    }
+
+    object ToolControl(JObject args)
+    {
+      var action = NormalizeAction(args, "resumeUntilStopped");
+      switch (action)
+      {
+        case "enterplay":
+          return WithSession(args, s => s.EnterPlayMode(args));
+        case "enterplayandstop":
+          return WithSession(args, s => s.EnterPlayAndStop(args));
+        case "runtests":
+          return WithSession(args, s => s.RunTests(args));
+        case "wait":
+        case "waitstopped":
+          return WithSession(args, s => s.WaitStopped(args));
+        case "snapshot":
+          return WithSession(args, s => s.Snapshot(args));
+        case "continue":
+          return WithSession(args, s => s.Continue(args));
+        case "resumeuntilstopped":
+          return WithSession(args, s => s.ResumeUntilStopped(args));
+        case "next":
+        case "stepover":
+          return WithSession(args, s => s.Next(args));
+        case "stepin":
+          return WithSession(args, s => s.StepIn(args));
+        case "stepout":
+          return WithSession(args, s => s.StepOut(args));
+        case "pause":
+          return WithSession(args, s => s.Pause(args));
+        default:
+          throw new InvalidOperationException("Unknown unity_debug_control action: " + action);
+      }
+    }
+
+    object ToolStatus(JObject args)
+    {
+      var action = NormalizeAction(args, "status");
+      switch (action)
+      {
+        case "status":
+          return WithSession(args, s => s.Status());
+        case "breakpoints":
+          return WithSession(args, s => s.ListBreakpoints(args));
+        case "diagnose":
+          return WithSession(args, s => s.Diagnose(args));
+        default:
+          throw new InvalidOperationException("Unknown unity_debug_status action: " + action);
+      }
+    }
+
+    static string NormalizeAction(JObject args, string defaultAction)
+    {
+      var action = (string)args["action"];
+      return (string.IsNullOrWhiteSpace(action) ? defaultAction : action.Trim()).ToLowerInvariant();
     }
 
     object ToolStart(JObject args)
@@ -684,6 +733,7 @@ namespace UnityDebugAdapter
     readonly int? m_UnityPid;
     readonly bool m_KillUnityHubLicensing;
     readonly double m_StartupTimeoutSeconds;
+    readonly double m_ReadyTimeoutSeconds;
     readonly double m_RequestTimeoutSeconds;
 
     Process m_UnityProcess;
@@ -711,6 +761,7 @@ namespace UnityDebugAdapter
       m_UnityPid = (int?)args["unityPid"];
       m_KillUnityHubLicensing = (bool?)args["killUnityHubLicensing"] ?? false;
       m_StartupTimeoutSeconds = (double?)args["startupTimeoutSeconds"] ?? 90.0;
+      m_ReadyTimeoutSeconds = (double?)args["readyTimeoutSeconds"] ?? 10.0;
       m_RequestTimeoutSeconds = (double?)args["requestTimeoutSeconds"] ?? 15.0;
 
       var logDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "mcp-logs", SessionId);
@@ -777,9 +828,16 @@ namespace UnityDebugAdapter
             ["name"] = $"Connect to Unity Editor instance at 127.0.0.1:{Port}",
             ["type"] = "unity",
             ["port"] = Port
-          }, 8.0));
-          var readyTimeout = Math.Max(1.0, (deadline - DateTime.UtcNow).TotalSeconds);
-          m_Client.WaitOutputContains("UnityDebugAdapter: target ready", readyTimeout);
+          }, Math.Max(8.0, m_ReadyTimeoutSeconds + 5.0)));
+          var readyTimeout = Math.Min(m_ReadyTimeoutSeconds, Math.Max(1.0, (deadline - DateTime.UtcNow).TotalSeconds));
+          try
+          {
+            m_Client.WaitOutputContains("UnityDebugAdapter: target ready", readyTimeout);
+          }
+          catch (TimeoutException)
+          {
+            m_Client.WaitOutputContains("UnityDebugAdapter: attached to Unity Mono runtime endpoint", 1.0);
+          }
           m_Attached = true;
           SaveTranscript();
           return Status();
@@ -787,8 +845,6 @@ namespace UnityDebugAdapter
         catch (Exception e)
         {
           last = e;
-          if (e is TimeoutException && last.Message.IndexOf("target ready", StringComparison.OrdinalIgnoreCase) >= 0)
-            throw new TimeoutException("attach completed but target ready was not observed: " + e.Message, e);
           System.Threading.Thread.Sleep(2000);
         }
       }
@@ -1066,21 +1122,16 @@ namespace UnityDebugAdapter
 
     public object EnterPlayMode(JObject args)
     {
-      var projectPath = FullPath((string)args["projectPath"] ?? m_ProjectPath);
-      if (!Directory.Exists(projectPath))
-        throw new DirectoryNotFoundException("Unity project not found: " + projectPath);
-
-      var tempPath = Path.Combine(projectPath, "Temp");
-      Directory.CreateDirectory(tempPath);
-      var triggerPath = Path.Combine(tempPath, "mcp-enter-play-mode");
-      File.WriteAllText(triggerPath, DateTimeOffset.UtcNow.ToString("O"), Encoding.UTF8);
+      var response = SendUnityControlCommand(new JObject
+      {
+        ["command"] = "enterPlay"
+      }, args);
 
       return new
       {
         sessionId = SessionId,
-        projectPath,
-        triggerPath,
-        requested = true
+        requested = true,
+        response
       };
     }
 
@@ -1181,6 +1232,123 @@ namespace UnityDebugAdapter
         sessionId = SessionId,
         response = response["body"]
       };
+    }
+
+    public object Next(JObject args)
+    {
+      return ExecuteAndMaybeStop("next", args, requireThread: true);
+    }
+
+    public object StepIn(JObject args)
+    {
+      return ExecuteAndMaybeStop("stepIn", args, requireThread: true);
+    }
+
+    public object StepOut(JObject args)
+    {
+      return ExecuteAndMaybeStop("stepOut", args, requireThread: true);
+    }
+
+    public object Pause(JObject args)
+    {
+      return ExecuteAndMaybeStop("pause", args, requireThread: false);
+    }
+
+    object ExecuteAndMaybeStop(string command, JObject args, bool requireThread)
+    {
+      var requestArgs = new JObject();
+      var threadId = (int?)args["threadId"] ?? (int?)m_LastStoppedEvent?["body"]?["threadId"];
+      if (threadId.HasValue)
+        requestArgs["threadId"] = threadId.Value;
+      else if (requireThread)
+        throw new InvalidOperationException("threadId is required because no stopped event is cached");
+
+      if (command != "pause")
+        requestArgs["granularity"] = "statement";
+
+      var response = m_Client.Request(command, requestArgs);
+      EnsureSuccess(response);
+      SaveTranscript();
+
+      var waitForStop = (bool?)args["waitForStop"] ?? true;
+      if (!waitForStop)
+      {
+        return new
+        {
+          sessionId = SessionId,
+          command,
+          response = response["body"],
+          status = Status()
+        };
+      }
+
+      var stopped = WaitStopped(args);
+      var snapshot = Snapshot(args);
+      return new
+      {
+        sessionId = SessionId,
+        command,
+        response = response["body"],
+        stopped,
+        snapshot,
+        status = Status()
+      };
+    }
+
+    public object RunTests(JObject args)
+    {
+      var testMode = (string)args["testMode"] ?? "EditMode";
+      var testFilter = (string)args["testFilter"];
+      var request = new JObject
+      {
+        ["command"] = "runTests",
+        ["testMode"] = testMode
+      };
+      if (!string.IsNullOrWhiteSpace(testFilter))
+        request["testFilter"] = testFilter;
+
+      var response = SendUnityControlCommand(request, args);
+
+      return new
+      {
+        sessionId = SessionId,
+        requested = true,
+        testMode,
+        testFilter,
+        response,
+        note = "Attach and set breakpoints before runTests; Unity starts the Test Runner after this control command is accepted."
+      };
+    }
+
+    JObject SendUnityControlCommand(JObject request, JObject args)
+    {
+      var timeoutMilliseconds = Math.Max(1000, (int)(((double?)args["controlTimeoutSeconds"] ?? 15.0) * 1000));
+      var controlPort = (int?)args["controlPort"] ?? (57000 + Math.Abs(UnityPid % 1000));
+      using (var client = new TcpClient())
+      {
+        var connect = client.BeginConnect("127.0.0.1", controlPort, null, null);
+        if (!connect.AsyncWaitHandle.WaitOne(timeoutMilliseconds))
+          throw new TimeoutException("timed out connecting to Unity MCP control port " + controlPort);
+        client.EndConnect(connect);
+        client.ReceiveTimeout = timeoutMilliseconds;
+        client.SendTimeout = timeoutMilliseconds;
+
+        var payload = Encoding.UTF8.GetBytes(request.ToString(Formatting.None) + "\n");
+        var stream = client.GetStream();
+        stream.Write(payload, 0, payload.Length);
+        stream.Flush();
+
+        using (var reader = new StreamReader(stream, Encoding.UTF8))
+        {
+          var line = reader.ReadLine();
+          if (string.IsNullOrWhiteSpace(line))
+            throw new InvalidOperationException("Unity MCP control port returned an empty response");
+          var response = JObject.Parse(line);
+          if ((bool?)response["ok"] != true)
+            throw new InvalidOperationException("Unity MCP control command failed: " + response.ToString(Formatting.None));
+          return response;
+        }
+      }
     }
 
     public object EnterPlayAndStop(JObject args)
@@ -1286,7 +1454,7 @@ namespace UnityDebugAdapter
     {
       var process = new Process();
       process.StartInfo.FileName = m_UnityExe;
-      process.StartInfo.Arguments = $"-projectPath \"{m_ProjectPath}\" -logFile \"{UnityLogPath}\" -executeMethod UnityEditor.EditorApplication.EnterPlaymode";
+      process.StartInfo.Arguments = $"-projectPath \"{m_ProjectPath}\" -logFile \"{UnityLogPath}\"";
       process.StartInfo.UseShellExecute = false;
       process.StartInfo.CreateNoWindow = false;
       process.Start();

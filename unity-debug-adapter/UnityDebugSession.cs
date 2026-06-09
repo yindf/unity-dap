@@ -34,6 +34,7 @@ namespace UnityDebugAdapter
     bool m_DebuggeeExecuting;
     readonly object m_Lock = new object();
     SoftDebuggerSession m_Session;
+    ManualResetEventSlim m_AttachReadyEvent;
     ProcessInfo m_ActiveProcess;
     Dictionary<string, Dictionary<int, Mono.Debugging.Client.Breakpoint>> m_Breakpoints;
     readonly List<Catchpoint> m_Catchpoints;
@@ -50,7 +51,9 @@ namespace UnityDebugAdapter
     public UnityDebugSession()
     {
       Logger.LogInfo("constructing UnityDebugSession");
+      DebuggerLoggingService.CustomLogger = new UnityDebuggerLogger();
       m_ResumeEvent = new AutoResetEvent(false);
+      m_AttachReadyEvent = new ManualResetEventSlim(false);
       m_Breakpoints = new Dictionary<string, Dictionary<int, Mono.Debugging.Client.Breakpoint>>();
       m_VariableHandles = new Handles<ObjectValue[]>();
       m_FrameHandles = new Handles<Mono.Debugging.Client.StackFrame>();
@@ -65,6 +68,29 @@ namespace UnityDebugAdapter
       CreateSession();
 
       Logger.LogInfo("done constructing UnityDebugSession");
+    }
+
+    class UnityDebuggerLogger : ICustomLogger
+    {
+      public void LogError(string message, Exception ex)
+      {
+        Logger.LogError(ex == null ? message : message + Environment.NewLine + ex);
+      }
+
+      public void LogAndShowException(string message, Exception ex)
+      {
+        LogError(message, ex);
+      }
+
+      public void LogMessage(string messageFormat, params object[] args)
+      {
+        Logger.LogInfo(messageFormat, args);
+      }
+
+      public string GetNewDebuggerLogFilename()
+      {
+        return null;
+      }
     }
 
     void CreateSession()
@@ -176,6 +202,7 @@ namespace UnityDebugAdapter
         {
           Logger.LogError("UnityDebugSession: failed to read process info on TargetReady: " + ex);
         }
+        m_AttachReadyEvent.Set();
       };
 
       m_Session.TargetExited += (sender, e) =>
@@ -296,7 +323,9 @@ namespace UnityDebugAdapter
 
     public override void Launch(int reqSeq, JToken args)
     {
-      AttachInternal(args);
+      if (!AttachInternal(reqSeq, "launch", args))
+        return;
+
       var response = new Response()
       {
         command = "launch",
@@ -308,7 +337,9 @@ namespace UnityDebugAdapter
 
     public override void Attach(int reqSeq, JToken args)
     {
-      AttachInternal(args);
+      if (!AttachInternal(reqSeq, "attach", args))
+        return;
+
       var response = new Response()
       {
         command = "attach",
@@ -318,29 +349,43 @@ namespace UnityDebugAdapter
       SendMessage(response);
     }
 
-    void AttachInternal(JToken args)
+    bool AttachInternal(int reqSeq, string command, JToken args)
     {
       var attachArgs = args.ToObject<LaunchRequestArguments>();
 
       if (attachArgs.address == null)
       {
         Logger.LogError("expected \"address\" property string in attach's arguments request");
-        return;
+        SendErrorResponse(reqSeq, command, 3020, "attach: expected address");
+        return false;
       }
       IPAddress address = IPAddress.Parse(attachArgs.address);
       ushort port;
       if (attachArgs.port == null)
       {
         Logger.LogError("expected \"port\" property int with a valid port in attach's arguments request");
-        return;
+        SendErrorResponse(reqSeq, command, 3021, "attach: expected port");
+        return false;
       }
       port = attachArgs.port.Value;
 
       SetExceptionBreakpoints(attachArgs.__exceptionOptions);
 
+      m_AttachReadyEvent.Reset();
       Connect(address, port);
 
       SendOutput("stdout", $"UnityDebugAdapter: attached to Unity Mono runtime endpoint via {address}:{port}");
+      if (!m_AttachReadyEvent.Wait(TimeSpan.FromSeconds(20)))
+      {
+        Logger.LogError("UnityDebugSession: attach timed out waiting for TargetReady. connected={0}, running={1}, exited={2}",
+            m_Session?.IsConnected ?? false,
+            m_Session?.IsRunning ?? false,
+            m_Session?.HasExited ?? false);
+        SendErrorResponse(reqSeq, command, 3022, "attach: timed out waiting for target ready");
+        return false;
+      }
+
+      return true;
     }
 
 
