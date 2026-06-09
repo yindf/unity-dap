@@ -107,9 +107,9 @@ namespace UnityDebugAdapter
       {
         ["tools"] = new JArray
         {
-          Tool("unity_debug_session", "Start, attach, prepare, disconnect, or clean up Unity debug sessions.",
+          Tool("unity_debug_session", "Status, attach, detach, reset, start, or prepare Unity debug sessions.",
               Obj(
-                Prop("action", "string", "start, attach, prepare, disconnect, cleanup. Default prepare."),
+                Prop("action", "string", "status, attach, detach, reset, start, prepare, disconnect, cleanup. Default status."),
                 Prop("projectPath", "string", "Unity project path. Defaults to the repository E2E fixture."),
                 Prop("sourcePath", "string", "Default source file path for later breakpoint requests."),
                 Prop("unityExe", "string", "Unity.exe path. Defaults to latest Unity Hub 2022.3 editor."),
@@ -245,14 +245,7 @@ namespace UnityDebugAdapter
           result = WithSession(args, s => s.RunTests(args));
           break;
         case "unity_debug_disconnect":
-          result = WithSession(args, s =>
-          {
-            var r = s.Disconnect();
-            m_Sessions.Remove(s.SessionId);
-            if (m_ActiveSessionId == s.SessionId)
-              m_ActiveSessionId = null;
-            return r;
-          });
+          result = WithSession(args, s => s.Detach());
           break;
         case "unity_debug_status":
           result = ToolStatus(args);
@@ -269,24 +262,21 @@ namespace UnityDebugAdapter
 
     object ToolSession(JObject args)
     {
-      var action = NormalizeAction(args, "prepare");
+      var action = NormalizeAction(args, "status");
       switch (action)
       {
+        case "status":
+          return ToolStatus(args);
         case "start":
           return ToolStart(args);
         case "attach":
           return ToolAttach(args);
         case "prepare":
           return ToolPrepare(args);
+        case "detach":
         case "disconnect":
-          return WithSession(args, s =>
-          {
-            var r = s.Disconnect();
-            m_Sessions.Remove(s.SessionId);
-            if (m_ActiveSessionId == s.SessionId)
-              m_ActiveSessionId = null;
-            return r;
-          });
+          return WithSession(args, s => s.Detach());
+        case "reset":
         case "cleanup":
           return ToolCleanup(args);
         default:
@@ -300,17 +290,17 @@ namespace UnityDebugAdapter
       switch (action)
       {
         case "set":
-          return WithSession(args, s => s.SetBreakpoints(args));
+          return GetOrCreateSession(args).SetBreakpoints(args);
         case "add":
-          return WithSession(args, s => s.AddBreakpoints(args));
+          return GetOrCreateSession(args).AddBreakpoints(args);
         case "remove":
-          return WithSession(args, s => s.RemoveBreakpoints(args));
+          return GetOrCreateSession(args).RemoveBreakpoints(args);
         case "update":
-          return WithSession(args, s => s.UpdateBreakpoint(args));
+          return GetOrCreateSession(args).UpdateBreakpoint(args);
         case "clear":
-          return WithSession(args, s => s.ClearBreakpoints(args));
+          return GetOrCreateSession(args).ClearBreakpoints(args);
         case "list":
-          return WithSession(args, s => s.ListBreakpoints(args));
+          return GetOrCreateSession(args).ListBreakpoints(args);
         default:
           throw new InvalidOperationException("Unknown unity_debug_breakpoints action: " + action);
       }
@@ -356,9 +346,11 @@ namespace UnityDebugAdapter
       switch (action)
       {
         case "status":
-          return WithSession(args, s => s.Status());
+          if (TryGetSession(args, out var session))
+            return session.Status();
+          return new { active = false, message = "no active session" };
         case "breakpoints":
-          return WithSession(args, s => s.ListBreakpoints(args));
+          return GetOrCreateSession(args).ListBreakpoints(args);
         case "diagnose":
           return WithSession(args, s => s.Diagnose(args));
         default:
@@ -374,27 +366,14 @@ namespace UnityDebugAdapter
 
     object ToolStart(JObject args)
     {
-      var session = new McpDebugSession(args);
-      try
-      {
-        var result = session.Start();
-        m_Sessions[session.SessionId] = session;
-        m_ActiveSessionId = session.SessionId;
-        return result;
-      }
-      catch
-      {
-        session.Cleanup();
-        throw;
-      }
+      var session = GetOrCreateSession(args);
+      return session.Attach(args, startUnityIfNoPid: true);
     }
 
     object ToolAttach(JObject args)
     {
-      if ((int?)args["unityPid"] == null)
-        throw new InvalidOperationException("unityPid is required for unity_debug_attach");
-
-      return ToolStart(args);
+      var session = GetOrCreateSession(args);
+      return session.Attach(args, startUnityIfNoPid: false);
     }
 
     object ToolRunFlow(JObject args)
@@ -455,7 +434,8 @@ namespace UnityDebugAdapter
           };
         }
 
-        disconnect = session.Disconnect();
+        disconnect = session.Detach();
+        session.Cleanup();
         return new
         {
           sessionId = session.SessionId,
@@ -475,19 +455,16 @@ namespace UnityDebugAdapter
 
     object ToolPrepare(JObject args)
     {
-      var session = new McpDebugSession(args);
+      var session = GetOrCreateSession(args);
       try
       {
-        var start = session.Start();
-        m_Sessions[session.SessionId] = session;
-        m_ActiveSessionId = session.SessionId;
-
         object breakpoints = null;
         object exceptionBreakpoints = null;
         if (args["lines"] != null || args["breakpoints"] != null)
           breakpoints = session.SetBreakpoints(args);
         if ((bool?)args["setExceptionBreakpoints"] ?? false)
           exceptionBreakpoints = session.SetExceptionBreakpoints();
+        var start = session.Attach(args, startUnityIfNoPid: true);
 
         return new
         {
@@ -501,7 +478,7 @@ namespace UnityDebugAdapter
       }
       catch
       {
-        session.Cleanup();
+        session.Detach();
         throw;
       }
     }
@@ -542,6 +519,41 @@ namespace UnityDebugAdapter
         throw new InvalidOperationException("session not found: " + sessionId);
       m_ActiveSessionId = sessionId;
       return action(session);
+    }
+
+    McpDebugSession GetOrCreateSession(JObject args)
+    {
+      var sessionId = (string)args["sessionId"];
+      if (!string.IsNullOrWhiteSpace(sessionId))
+      {
+        if (!m_Sessions.TryGetValue(sessionId, out var explicitSession))
+          throw new InvalidOperationException("session not found: " + sessionId);
+        m_ActiveSessionId = explicitSession.SessionId;
+        return explicitSession;
+      }
+
+      if (!string.IsNullOrWhiteSpace(m_ActiveSessionId) && m_Sessions.TryGetValue(m_ActiveSessionId, out var activeSession))
+        return activeSession;
+
+      var session = new McpDebugSession(args);
+      m_Sessions[session.SessionId] = session;
+      m_ActiveSessionId = session.SessionId;
+      return session;
+    }
+
+    bool TryGetSession(JObject args, out McpDebugSession session)
+    {
+      var sessionId = (string)args["sessionId"];
+      if (string.IsNullOrWhiteSpace(sessionId))
+        sessionId = m_ActiveSessionId;
+      if (!string.IsNullOrWhiteSpace(sessionId) && m_Sessions.TryGetValue(sessionId, out session))
+      {
+        m_ActiveSessionId = sessionId;
+        return true;
+      }
+
+      session = null;
+      return false;
     }
 
     static JObject ToolText(object value)
@@ -727,14 +739,13 @@ namespace UnityDebugAdapter
   {
     readonly string m_Root;
     readonly string m_AdapterPath;
-    readonly string m_ProjectPath;
-    readonly string m_SourcePath;
-    readonly string m_UnityExe;
-    readonly int? m_UnityPid;
-    readonly bool m_KillUnityHubLicensing;
-    readonly double m_StartupTimeoutSeconds;
-    readonly double m_ReadyTimeoutSeconds;
-    readonly double m_RequestTimeoutSeconds;
+    string m_ProjectPath;
+    string m_SourcePath;
+    string m_UnityExe;
+    bool m_KillUnityHubLicensing;
+    double m_StartupTimeoutSeconds;
+    double m_ReadyTimeoutSeconds;
+    double m_RequestTimeoutSeconds;
 
     Process m_UnityProcess;
     DapProcessClient m_Client;
@@ -742,6 +753,7 @@ namespace UnityDebugAdapter
     readonly Dictionary<string, SortedDictionary<int, McpBreakpointSpec>> m_BreakpointsBySource = new Dictionary<string, SortedDictionary<int, McpBreakpointSpec>>(StringComparer.OrdinalIgnoreCase);
     bool m_Attached;
     bool m_OwnsUnityProcess;
+    bool m_SetExceptionBreakpoints;
 
     public string SessionId { get; }
     public int UnityPid { get; private set; }
@@ -755,14 +767,13 @@ namespace UnityDebugAdapter
       m_Root = FindRepositoryRoot();
       SessionId = "unity-" + DateTime.UtcNow.ToString("yyyyMMddHHmmssfff") + "-" + Guid.NewGuid().ToString("N").Substring(0, 8);
       m_AdapterPath = Path.GetFullPath(Process.GetCurrentProcess().MainModule.FileName);
-      m_ProjectPath = FullPath((string)args["projectPath"] ?? "unity-debug-adapter.E2ETests/unity_test_project_2022_3");
-      m_SourcePath = FullPath((string)args["sourcePath"] ?? Path.Combine(m_ProjectPath, "Assets", "Scripts", "TestScript.cs"));
-      m_UnityExe = (string)args["unityExe"] ?? FindUnityExe();
-      m_UnityPid = (int?)args["unityPid"];
-      m_KillUnityHubLicensing = (bool?)args["killUnityHubLicensing"] ?? false;
-      m_StartupTimeoutSeconds = (double?)args["startupTimeoutSeconds"] ?? 90.0;
-      m_ReadyTimeoutSeconds = (double?)args["readyTimeoutSeconds"] ?? 10.0;
-      m_RequestTimeoutSeconds = (double?)args["requestTimeoutSeconds"] ?? 15.0;
+      m_ProjectPath = FullPath("unity-debug-adapter.E2ETests/unity_test_project_2022_3");
+      m_SourcePath = FullPath(Path.Combine(m_ProjectPath, "Assets", "Scripts", "TestScript.cs"));
+      m_UnityExe = FindUnityExe();
+      m_StartupTimeoutSeconds = 90.0;
+      m_ReadyTimeoutSeconds = 10.0;
+      m_RequestTimeoutSeconds = 15.0;
+      ApplyOptions(args);
 
       var logDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "mcp-logs", SessionId);
       Directory.CreateDirectory(logDir);
@@ -773,31 +784,25 @@ namespace UnityDebugAdapter
 
     public object Start()
     {
+      return Attach(new JObject(), startUnityIfNoPid: true);
+    }
+
+    public object Attach(JObject args, bool startUnityIfNoPid)
+    {
+      ApplyOptions(args);
+
       if (!File.Exists(m_AdapterPath))
         throw new FileNotFoundException("adapter executable not found", m_AdapterPath);
-      if (!Directory.Exists(m_ProjectPath))
-        throw new DirectoryNotFoundException("Unity project not found: " + m_ProjectPath);
 
-      if (m_KillUnityHubLicensing)
-        KillUnityHubLicensing();
+      var requestedUnityPid = (int?)args["unityPid"];
+      if (m_Attached && m_Client?.IsRunning == true)
+      {
+        if (!requestedUnityPid.HasValue || requestedUnityPid.Value == UnityPid)
+          return Status();
+        Detach();
+      }
 
-      if (m_UnityPid.HasValue)
-      {
-        UnityPid = m_UnityPid.Value;
-        m_UnityProcess = TryGetProcessById(UnityPid);
-        if (m_UnityProcess == null)
-          throw new InvalidOperationException($"Unity process {UnityPid} was not found");
-      }
-      else
-      {
-        if (string.IsNullOrWhiteSpace(m_UnityExe) || !File.Exists(m_UnityExe))
-          throw new FileNotFoundException("Unity editor not found", m_UnityExe);
-        m_UnityProcess = StartUnity();
-        m_OwnsUnityProcess = true;
-        UnityPid = m_UnityProcess.Id;
-        if (m_UnityProcess.HasExited)
-          throw new InvalidOperationException($"Unity exited during startup with code {m_UnityProcess.ExitCode}; see {UnityLogPath}");
-      }
+      ResolveUnityProcess(requestedUnityPid, startUnityIfNoPid);
 
       Port = 56000 + UnityPid % 1000;
       m_Client = new DapProcessClient(m_AdapterPath, AdapterLogPath, m_RequestTimeoutSeconds);
@@ -828,19 +833,23 @@ namespace UnityDebugAdapter
             ["name"] = $"Connect to Unity Editor instance at 127.0.0.1:{Port}",
             ["type"] = "unity",
             ["port"] = Port
-          }, Math.Max(8.0, m_ReadyTimeoutSeconds + 5.0)));
-          var readyTimeout = Math.Min(m_ReadyTimeoutSeconds, Math.Max(1.0, (deadline - DateTime.UtcNow).TotalSeconds));
-          try
-          {
-            m_Client.WaitOutputContains("UnityDebugAdapter: target ready", readyTimeout);
-          }
-          catch (TimeoutException)
-          {
-            m_Client.WaitOutputContains("UnityDebugAdapter: attached to Unity Mono runtime endpoint", 1.0);
-          }
+          }, Math.Max(25.0, m_ReadyTimeoutSeconds + 25.0)));
           m_Attached = true;
+          var breakpointSync = SyncAllBreakpoints();
+          object exceptionBreakpoints = null;
+          if (m_SetExceptionBreakpoints)
+            exceptionBreakpoints = SyncExceptionBreakpoints();
           SaveTranscript();
-          return Status();
+          return new
+          {
+            sessionId = SessionId,
+            attached = true,
+            unityPid = UnityPid,
+            port = Port,
+            breakpointSync,
+            exceptionBreakpoints,
+            status = Status()
+          };
         }
         catch (Exception e)
         {
@@ -849,7 +858,79 @@ namespace UnityDebugAdapter
         }
       }
 
-      throw new TimeoutException("attach timed out: " + last?.Message);
+      var timeoutMessage = "attach timed out: " + last?.Message;
+      try { Detach(); }
+      catch { }
+      throw new TimeoutException(timeoutMessage);
+    }
+
+    void ApplyOptions(JObject args)
+    {
+      if (args == null)
+        return;
+      if (args["projectPath"] != null)
+      {
+        m_ProjectPath = FullPath((string)args["projectPath"]);
+        if (args["sourcePath"] == null)
+          m_SourcePath = FullPath(Path.Combine(m_ProjectPath, "Assets", "Scripts", "TestScript.cs"));
+      }
+      if (args["sourcePath"] != null)
+        m_SourcePath = FullPath((string)args["sourcePath"]);
+      if (args["unityExe"] != null)
+        m_UnityExe = (string)args["unityExe"];
+      if (args["killUnityHubLicensing"] != null)
+        m_KillUnityHubLicensing = (bool?)args["killUnityHubLicensing"] ?? false;
+      if (args["startupTimeoutSeconds"] != null)
+        m_StartupTimeoutSeconds = (double?)args["startupTimeoutSeconds"] ?? m_StartupTimeoutSeconds;
+      if (args["readyTimeoutSeconds"] != null)
+        m_ReadyTimeoutSeconds = (double?)args["readyTimeoutSeconds"] ?? m_ReadyTimeoutSeconds;
+      if (args["requestTimeoutSeconds"] != null)
+        m_RequestTimeoutSeconds = (double?)args["requestTimeoutSeconds"] ?? m_RequestTimeoutSeconds;
+    }
+
+    void ResolveUnityProcess(int? requestedUnityPid, bool startUnityIfNoPid)
+    {
+      if (requestedUnityPid.HasValue)
+      {
+        UnityPid = requestedUnityPid.Value;
+        m_UnityProcess = TryGetProcessById(UnityPid);
+        if (m_UnityProcess == null)
+          throw new InvalidOperationException($"Unity process {UnityPid} was not found");
+        m_OwnsUnityProcess = false;
+        return;
+      }
+
+      if (UnityPid > 0 && ProcessExists(UnityPid))
+      {
+        m_UnityProcess = TryGetProcessById(UnityPid);
+        return;
+      }
+
+      if (startUnityIfNoPid)
+      {
+        if (!Directory.Exists(m_ProjectPath))
+          throw new DirectoryNotFoundException("Unity project not found: " + m_ProjectPath);
+        if (string.IsNullOrWhiteSpace(m_UnityExe) || !File.Exists(m_UnityExe))
+          throw new FileNotFoundException("Unity editor not found", m_UnityExe);
+        if (m_KillUnityHubLicensing)
+          KillUnityHubLicensing();
+        m_UnityProcess = StartUnity();
+        m_OwnsUnityProcess = true;
+        UnityPid = m_UnityProcess.Id;
+        if (m_UnityProcess.HasExited)
+          throw new InvalidOperationException($"Unity exited during startup with code {m_UnityProcess.ExitCode}; see {UnityLogPath}");
+        return;
+      }
+
+      var unityProcesses = FindUnityProcesses();
+      if (unityProcesses.Length == 0)
+        throw new InvalidOperationException("unityPid is required because no running Unity Editor process was found");
+      if (unityProcesses.Length > 1)
+        throw new InvalidOperationException("unityPid is required because multiple Unity Editor processes are running: " + string.Join(", ", unityProcesses.Select(p => p.Id)));
+
+      m_UnityProcess = unityProcesses[0];
+      m_OwnsUnityProcess = false;
+      UnityPid = m_UnityProcess.Id;
     }
 
     public object SetBreakpoints(JObject args)
@@ -951,6 +1032,19 @@ namespace UnityDebugAdapter
     object SyncBreakpoints(string sourcePath)
     {
       var tracked = GetTrackedBreakpoints(sourcePath);
+      if (!IsAttached())
+      {
+        return new
+        {
+          sessionId = SessionId,
+          sourcePath,
+          attached = false,
+          synced = false,
+          lines = tracked.Keys.ToArray(),
+          breakpoints = BreakpointSpecsToJson(tracked)
+        };
+      }
+
       var breakpoints = new JArray(tracked.Values.Select(bp => bp.ToDap()));
       var response = m_Client.Request("setBreakpoints", new JObject
       {
@@ -964,6 +1058,7 @@ namespace UnityDebugAdapter
         ["sourceModified"] = false
       });
       EnsureSuccess(response);
+      m_LastStoppedEvent = null;
       SaveTranscript();
       return new
       {
@@ -973,6 +1068,14 @@ namespace UnityDebugAdapter
         breakpoints = BreakpointSpecsToJson(tracked),
         response = response["body"]
       };
+    }
+
+    JArray SyncAllBreakpoints()
+    {
+      var results = new JArray();
+      foreach (var sourcePath in m_BreakpointsBySource.Keys.ToArray())
+        results.Add(JToken.FromObject(SyncBreakpoints(sourcePath)));
+      return results;
     }
 
     SortedDictionary<int, McpBreakpointSpec> GetTrackedBreakpoints(string sourcePath)
@@ -1107,6 +1210,23 @@ namespace UnityDebugAdapter
 
     public object SetExceptionBreakpoints()
     {
+      m_SetExceptionBreakpoints = true;
+      return SyncExceptionBreakpoints();
+    }
+
+    object SyncExceptionBreakpoints()
+    {
+      if (!IsAttached())
+      {
+        return new
+        {
+          sessionId = SessionId,
+          attached = false,
+          synced = false,
+          filters = new JArray()
+        };
+      }
+
       var response = m_Client.Request("setExceptionBreakpoints", new JObject
       {
         ["filters"] = new JArray()
@@ -1122,6 +1242,7 @@ namespace UnityDebugAdapter
 
     public object EnterPlayMode(JObject args)
     {
+      EnsureAttached();
       var response = SendUnityControlCommand(new JObject
       {
         ["command"] = "enterPlay"
@@ -1137,6 +1258,7 @@ namespace UnityDebugAdapter
 
     public object WaitStopped(JObject args)
     {
+      EnsureAttached();
       var timeout = (double?)args["timeoutSeconds"] ?? 60.0;
       m_LastStoppedEvent = m_Client.WaitEvent("stopped", timeout);
       SaveTranscript();
@@ -1149,6 +1271,7 @@ namespace UnityDebugAdapter
 
     public object Snapshot(JObject args)
     {
+      EnsureAttached();
       var threadId = (int?)args["threadId"] ?? (int?)m_LastStoppedEvent?["body"]?["threadId"];
       if (!threadId.HasValue)
         throw new InvalidOperationException("threadId is required because no stopped event is cached");
@@ -1216,6 +1339,7 @@ namespace UnityDebugAdapter
 
     public object Continue(JObject args)
     {
+      EnsureAttached();
       var threadId = (int?)args["threadId"] ?? (int?)m_LastStoppedEvent?["body"]?["threadId"];
       if (!threadId.HasValue)
         throw new InvalidOperationException("threadId is required because no stopped event is cached");
@@ -1256,6 +1380,7 @@ namespace UnityDebugAdapter
 
     object ExecuteAndMaybeStop(string command, JObject args, bool requireThread)
     {
+      EnsureAttached();
       var requestArgs = new JObject();
       var threadId = (int?)args["threadId"] ?? (int?)m_LastStoppedEvent?["body"]?["threadId"];
       if (threadId.HasValue)
@@ -1297,6 +1422,7 @@ namespace UnityDebugAdapter
 
     public object RunTests(JObject args)
     {
+      EnsureAttached();
       var testMode = (string)args["testMode"] ?? "EditMode";
       var testFilter = (string)args["testFilter"];
       var request = new JObject
@@ -1383,14 +1509,40 @@ namespace UnityDebugAdapter
 
     public object Disconnect()
     {
+      return Detach();
+    }
+
+    public object Detach()
+    {
+      object continued = null;
       JObject response = null;
       if (m_Client != null)
+      {
+        if (m_LastStoppedEvent != null && m_Client.IsRunning)
+        {
+          try
+          {
+            continued = Continue(new JObject());
+          }
+          catch (Exception e)
+          {
+            continued = new { error = e.Message };
+          }
+        }
         response = m_Client.Disconnect();
-      Cleanup();
+        if (m_Client.IsRunning)
+          m_Client.Stop();
+        SaveTranscript();
+      }
+
+      m_Client = null;
+      m_Attached = false;
+      m_LastStoppedEvent = null;
       return new
       {
         sessionId = SessionId,
-        disconnected = response != null,
+        detached = response != null,
+        continued,
         response
       };
     }
@@ -1406,6 +1558,8 @@ namespace UnityDebugAdapter
         adapterAlive = m_Client?.IsRunning ?? false,
         unityAlive = IsUnityProcessAlive(),
         lastStopped = m_LastStoppedEvent?["body"],
+        breakpoints = BreakpointSnapshot(),
+        exceptionBreakpoints = m_SetExceptionBreakpoints,
         adapterLogPath = AdapterLogPath,
         unityLogPath = UnityLogPath,
         transcriptPath = TranscriptPath,
@@ -1428,14 +1582,7 @@ namespace UnityDebugAdapter
 
     public void Cleanup()
     {
-      try
-      {
-        if (m_Client != null)
-        {
-          m_Client.Stop();
-          SaveTranscript();
-        }
-      }
+      try { Detach(); }
       catch { }
 
       try
@@ -1448,6 +1595,13 @@ namespace UnityDebugAdapter
         }
       }
       catch { }
+
+      m_BreakpointsBySource.Clear();
+      m_SetExceptionBreakpoints = false;
+      UnityPid = 0;
+      Port = 0;
+      m_UnityProcess = null;
+      m_OwnsUnityProcess = false;
     }
 
     Process StartUnity()
@@ -1527,6 +1681,17 @@ namespace UnityDebugAdapter
       }
     }
 
+    bool IsAttached()
+    {
+      return m_Attached && m_Client?.IsRunning == true;
+    }
+
+    void EnsureAttached()
+    {
+      if (!IsAttached())
+        throw new InvalidOperationException("debug session is detached; call unity_debug_session with action=attach first");
+    }
+
     static Process TryGetProcessById(int pid)
     {
       try
@@ -1556,6 +1721,24 @@ namespace UnityDebugAdapter
       }
 
       return false;
+    }
+
+    static Process[] FindUnityProcesses()
+    {
+      return Process.GetProcesses()
+          .Where(process =>
+          {
+            try
+            {
+              return string.Equals(process.ProcessName, "Unity", StringComparison.OrdinalIgnoreCase)
+                  && !process.HasExited;
+            }
+            catch
+            {
+              return false;
+            }
+          })
+          .ToArray();
     }
 
     static string FindRepositoryRoot()
@@ -1767,7 +1950,7 @@ namespace UnityDebugAdapter
         return Request("disconnect", new JObject
         {
           ["restart"] = false,
-          ["terminateDebuggee"] = true
+          ["terminateDebuggee"] = false
         }, 5.0);
       }
       catch

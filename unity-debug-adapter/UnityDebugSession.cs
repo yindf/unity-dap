@@ -377,12 +377,23 @@ namespace UnityDebugAdapter
       SendOutput("stdout", $"UnityDebugAdapter: attached to Unity Mono runtime endpoint via {address}:{port}");
       if (!m_AttachReadyEvent.Wait(TimeSpan.FromSeconds(20)))
       {
-        Logger.LogError("UnityDebugSession: attach timed out waiting for TargetReady. connected={0}, running={1}, exited={2}",
-            m_Session?.IsConnected ?? false,
-            m_Session?.IsRunning ?? false,
-            m_Session?.HasExited ?? false);
-        SendErrorResponse(reqSeq, command, 3022, "attach: timed out waiting for target ready");
-        return false;
+        var connected = m_Session?.IsConnected ?? false;
+        var running = m_Session?.IsRunning ?? false;
+        var exited = m_Session?.HasExited ?? false;
+        if (!connected)
+        {
+          Logger.LogError("UnityDebugSession: attach timed out waiting for TargetReady. connected={0}, running={1}, exited={2}",
+              connected,
+              running,
+              exited);
+          SendErrorResponse(reqSeq, command, 3022, "attach: timed out waiting for target ready");
+          return false;
+        }
+
+        Logger.LogInfo("UnityDebugSession: attach continued without TargetReady. connected={0}, running={1}, exited={2}",
+            connected,
+            running,
+            exited);
       }
 
       return true;
