@@ -27,6 +27,14 @@ When CSharpMCP code exploration tools are available, prefer them for navigating 
 
 Tests use NUnit with `Microsoft.NET.Test.Sdk`, `NUnit3TestAdapter`, and `coverlet.collector`. Name test classes after the subject plus scope, for example `UnityDebugSession_E2ETests`, and use clear `Test_...` method names. E2E tests start a real Unity Editor from Unity Hub and replay requests from `unity-debug-adapter.E2ETests/log.txt`, so keep that log and expected response assertions synchronized when protocol behavior changes.
 
+## MCP Debug Adapter Notes
+
+The MCP flow must support repeated attach/detach against the same Unity Editor, including re-attaching while Unity is already in Play Mode. `McpDebugSession.Detach()` should only tear down the DAP adapter client state; keep the Unity process identity, port, tracked breakpoints, and session metadata until explicit cleanup/reset. The DAP adapter process exits after `disconnect`, so do not reuse a `DapProcessClient` across detach, but preserve it within a single attach retry window.
+
+When handling DAP `disconnect`, release the Mono soft debugger connection synchronously before disposing the adapter or exiting the process. `DebuggerSession.Detach()` dispatches through the operation thread and can return before `SoftDebuggerSession.OnDetach()` runs; exiting immediately after that can leave Unity's debugger endpoint unable to accept a second attach.
+
+Use this regression flow after changes in `McpServer.cs`, `UnityDebugSession.cs`, or `debugger-libs`: set a breakpoint, attach, enter Play, wait for a hit, snapshot, detach; then set another breakpoint, attach again without entering Play, wait for a hit, snapshot, and detach.
+
 ## Commit & Pull Request Guidelines
 
 Recent commits use concise Conventional Commit-style prefixes such as `fix:`, `fix!:`, `chore:`, `ci:`, and `docs:`; keep subjects short and imperative. For pull requests, include the behavior changed, commands run, Unity/.NET versions used for testing, and any screenshots or logs when debugging behavior or E2E output changes.

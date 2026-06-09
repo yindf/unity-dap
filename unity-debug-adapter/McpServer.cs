@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -798,27 +799,41 @@ namespace UnityDebugAdapter
       if (m_Attached && m_Client?.IsRunning == true)
       {
         if (!requestedUnityPid.HasValue || requestedUnityPid.Value == UnityPid)
-          return Status();
+        {
+          var breakpointSync = SyncRequestedBreakpoints(args);
+          if (breakpointSync == null)
+            return Status();
+
+          return new
+          {
+            sessionId = SessionId,
+            attached = true,
+            unityPid = UnityPid,
+            port = Port,
+            breakpointSync = new JArray(JToken.FromObject(breakpointSync)),
+            exceptionBreakpoints = (object)null,
+            status = Status()
+          };
+        }
         Detach();
       }
 
+      SyncRequestedBreakpoints(args);
       ResolveUnityProcess(requestedUnityPid, startUnityIfNoPid);
 
       Port = 56000 + UnityPid % 1000;
-      m_Client = new DapProcessClient(m_AdapterPath, AdapterLogPath, m_RequestTimeoutSeconds);
-      m_Client.Start();
-      EnsureSuccess(m_Client.Request("initialize", new JObject
-      {
-        ["adapterID"] = "unity-debug-adapter-mcp",
-        ["linesStartAt1"] = true,
-        ["columnsStartAt1"] = true,
-        ["pathFormat"] = "path",
-        ["clientName"] = "mcp",
-        ["clientID"] = "mcp"
-      }));
-
       var deadline = DateTime.UtcNow.AddSeconds(m_StartupTimeoutSeconds);
       Exception last = null;
+      var attempt = 0;
+      Logger.LogInfo(
+          "MCP attach begin session={0}, unityPid={1}, port={2}, startupTimeoutSeconds={3}, readyTimeoutSeconds={4}, requestTimeoutSeconds={5}",
+          SessionId,
+          UnityPid,
+          Port,
+          m_StartupTimeoutSeconds,
+          m_ReadyTimeoutSeconds,
+          m_RequestTimeoutSeconds);
+      StartAdapterClient();
       while (DateTime.UtcNow < deadline)
       {
         if (!IsUnityProcessAlive())
@@ -826,13 +841,18 @@ namespace UnityDebugAdapter
 
         try
         {
+          attempt++;
+          Logger.LogInfo("MCP attach attempt {0} starting for session={1}", attempt, SessionId);
+          if (m_Client == null || !m_Client.IsRunning)
+            StartAdapterClient();
           EnsureSuccess(m_Client.Request("attach", new JObject
           {
             ["address"] = "127.0.0.1",
             ["request"] = "attach",
             ["name"] = $"Connect to Unity Editor instance at 127.0.0.1:{Port}",
             ["type"] = "unity",
-            ["port"] = Port
+            ["port"] = Port,
+            ["attachReadyTimeoutSeconds"] = Math.Max(20.0, m_ReadyTimeoutSeconds)
           }, Math.Max(25.0, m_ReadyTimeoutSeconds + 25.0)));
           m_Attached = true;
           var breakpointSync = SyncAllBreakpoints();
@@ -854,6 +874,10 @@ namespace UnityDebugAdapter
         catch (Exception e)
         {
           last = e;
+          Logger.LogWarn("MCP attach attempt {0} failed for session={1}: {2}", attempt, SessionId, e.Message);
+          SaveTranscript();
+          if (m_Client == null || !m_Client.IsRunning)
+            StopAdapterClient();
           System.Threading.Thread.Sleep(2000);
         }
       }
@@ -862,6 +886,44 @@ namespace UnityDebugAdapter
       try { Detach(); }
       catch { }
       throw new TimeoutException(timeoutMessage);
+    }
+
+    void StartAdapterClient()
+    {
+      StopAdapterClient();
+      m_Client = new DapProcessClient(m_AdapterPath, AdapterLogPath, m_RequestTimeoutSeconds);
+      m_Client.Start();
+      EnsureSuccess(m_Client.Request("initialize", new JObject
+      {
+        ["adapterID"] = "unity-debug-adapter-mcp",
+        ["linesStartAt1"] = true,
+        ["columnsStartAt1"] = true,
+        ["pathFormat"] = "path",
+        ["clientName"] = "mcp",
+        ["clientID"] = "mcp"
+      }));
+    }
+
+    void StopAdapterClient()
+    {
+      if (m_Client == null)
+        return;
+
+      if (m_Client.IsRunning)
+        m_Client.Disconnect();
+
+      if (m_Client.IsRunning)
+        m_Client.Stop();
+      m_Client = null;
+      m_Attached = false;
+      m_LastStoppedEvent = null;
+    }
+
+    object SyncRequestedBreakpoints(JObject args)
+    {
+      if (args?["lines"] == null && args?["breakpoints"] == null)
+        return null;
+      return SetBreakpoints(args);
     }
 
     void ApplyOptions(JObject args)
@@ -906,6 +968,18 @@ namespace UnityDebugAdapter
         return;
       }
 
+      var unityProcesses = FindUnityProcesses(m_ProjectPath);
+      if (unityProcesses.Length == 1)
+      {
+        m_UnityProcess = unityProcesses[0];
+        m_OwnsUnityProcess = false;
+        UnityPid = m_UnityProcess.Id;
+        return;
+      }
+
+      if (unityProcesses.Length > 1)
+        throw new InvalidOperationException("unityPid is required because multiple Unity Editor processes are running: " + string.Join(", ", unityProcesses.Select(p => p.Id)));
+
       if (startUnityIfNoPid)
       {
         if (!Directory.Exists(m_ProjectPath))
@@ -922,15 +996,7 @@ namespace UnityDebugAdapter
         return;
       }
 
-      var unityProcesses = FindUnityProcesses();
-      if (unityProcesses.Length == 0)
-        throw new InvalidOperationException("unityPid is required because no running Unity Editor process was found");
-      if (unityProcesses.Length > 1)
-        throw new InvalidOperationException("unityPid is required because multiple Unity Editor processes are running: " + string.Join(", ", unityProcesses.Select(p => p.Id)));
-
-      m_UnityProcess = unityProcesses[0];
-      m_OwnsUnityProcess = false;
-      UnityPid = m_UnityProcess.Id;
+      throw new InvalidOperationException("unityPid is required because no running Unity Editor process was found");
     }
 
     public object SetBreakpoints(JObject args)
@@ -1723,22 +1789,249 @@ namespace UnityDebugAdapter
       return false;
     }
 
-    static Process[] FindUnityProcesses()
+    static Process[] FindUnityProcesses(string projectPath)
     {
-      return Process.GetProcesses()
-          .Where(process =>
-          {
-            try
-            {
-              return string.Equals(process.ProcessName, "Unity", StringComparison.OrdinalIgnoreCase)
-                  && !process.HasExited;
-            }
-            catch
-            {
-              return false;
-            }
-          })
+      var candidates = Process.GetProcesses()
+          .Where(IsUnityEditorProcess)
           .ToArray();
+      if (candidates.Length <= 1)
+        return candidates;
+
+      var projectMatches = candidates
+          .Where(process => IsUnityProcessForProject(process, projectPath))
+          .ToArray();
+      return projectMatches.Length > 0 ? projectMatches : candidates;
+    }
+
+    static bool IsUnityEditorProcess(Process process)
+    {
+      var processName = TryGetProcessName(process);
+      if (IsUnityEditorProcessName(processName))
+        return !HasProcessExited(process);
+
+      if (HasProcessExited(process))
+        return false;
+
+      var mainModulePath = TryGetMainModulePath(process);
+      return IsUnityEditorProcessName(Path.GetFileNameWithoutExtension(mainModulePath));
+    }
+
+    static string TryGetProcessName(Process process)
+    {
+      try
+      {
+        return process.ProcessName;
+      }
+      catch
+      {
+        return null;
+      }
+    }
+
+    static bool IsUnityEditorProcessName(string processName)
+    {
+      return string.Equals(processName, "Unity", StringComparison.OrdinalIgnoreCase)
+          || string.Equals(processName, "Unity Editor", StringComparison.OrdinalIgnoreCase);
+    }
+
+    static bool HasProcessExited(Process process)
+    {
+      try
+      {
+        process.Refresh();
+        return process.HasExited;
+      }
+      catch
+      {
+        return false;
+      }
+    }
+
+    static string TryGetMainModulePath(Process process)
+    {
+      try
+      {
+        return process.MainModule?.FileName;
+      }
+      catch
+      {
+        return null;
+      }
+    }
+
+    static bool IsUnityProcessForProject(Process process, string projectPath)
+    {
+      if (string.IsNullOrWhiteSpace(projectPath))
+        return false;
+
+      var expectedProjectPath = NormalizeProjectPath(projectPath);
+      if (string.IsNullOrWhiteSpace(expectedProjectPath))
+        return false;
+
+      foreach (var candidateProjectPath in ReadProjectPathsFromProcessArguments(process))
+      {
+        var normalizedCandidate = NormalizeProjectPath(candidateProjectPath);
+        if (string.Equals(normalizedCandidate, expectedProjectPath, StringComparison.OrdinalIgnoreCase))
+          return true;
+      }
+
+      return false;
+    }
+
+    static IEnumerable<string> ReadProjectPathsFromProcessArguments(Process process)
+    {
+      var args = TryGetProcessArguments(process);
+      for (var i = 0; i < args.Length; i++)
+      {
+        var arg = args[i];
+        if (string.Equals(arg, "-projectPath", StringComparison.OrdinalIgnoreCase))
+        {
+          if (i + 1 < args.Length)
+            yield return args[i + 1];
+          continue;
+        }
+
+        const string prefix = "-projectPath=";
+        if (arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+          yield return arg.Substring(prefix.Length);
+      }
+    }
+
+    static string[] TryGetProcessArguments(Process process)
+    {
+      if (Environment.OSVersion.Platform == PlatformID.Win32NT)
+      {
+        var commandLine = TryGetWindowsProcessCommandLine(process);
+        return string.IsNullOrWhiteSpace(commandLine)
+            ? Array.Empty<string>()
+            : SplitCommandLine(commandLine);
+      }
+
+      try
+      {
+        var procCmdLine = "/proc/" + process.Id + "/cmdline";
+        if (File.Exists(procCmdLine))
+          return SplitNullTerminatedArguments(File.ReadAllBytes(procCmdLine));
+      }
+      catch
+      {
+      }
+
+      return Array.Empty<string>();
+    }
+
+    static string TryGetWindowsProcessCommandLine(Process process)
+    {
+      try
+      {
+        var searcherType = Type.GetType("System.Management.ManagementObjectSearcher, System.Management");
+        if (searcherType == null)
+          return null;
+
+        using (var searcher = (IDisposable)Activator.CreateInstance(
+            searcherType,
+            "SELECT CommandLine FROM Win32_Process WHERE ProcessId = " + process.Id))
+        {
+          var getMethod = searcherType.GetMethod("Get", Type.EmptyTypes);
+          using (var results = (IDisposable)getMethod.Invoke(searcher, null))
+          {
+            var enumerable = results as IEnumerable;
+            if (enumerable == null)
+              return null;
+
+            foreach (var result in enumerable)
+            {
+              try
+              {
+                var itemProperty = result.GetType().GetProperty("Item", new[] { typeof(string) });
+                return itemProperty?.GetValue(result, new object[] { "CommandLine" }) as string;
+              }
+              finally
+              {
+                (result as IDisposable)?.Dispose();
+              }
+            }
+          }
+        }
+      }
+      catch
+      {
+      }
+
+      return null;
+    }
+
+    static string[] SplitCommandLine(string commandLine)
+    {
+      var args = new List<string>();
+      var current = new StringBuilder();
+      var inQuotes = false;
+      for (var i = 0; i < commandLine.Length; i++)
+      {
+        var ch = commandLine[i];
+        if (ch == '"')
+        {
+          inQuotes = !inQuotes;
+          continue;
+        }
+
+        if (char.IsWhiteSpace(ch) && !inQuotes)
+        {
+          if (current.Length > 0)
+          {
+            args.Add(current.ToString());
+            current.Clear();
+          }
+          continue;
+        }
+
+        current.Append(ch);
+      }
+
+      if (current.Length > 0)
+        args.Add(current.ToString());
+      return args.ToArray();
+    }
+
+    static string[] SplitNullTerminatedArguments(byte[] bytes)
+    {
+      var args = new List<string>();
+      var start = 0;
+      for (var i = 0; i < bytes.Length; i++)
+      {
+        if (bytes[i] != 0)
+          continue;
+
+        if (i > start)
+          args.Add(Encoding.UTF8.GetString(bytes, start, i - start));
+        start = i + 1;
+      }
+
+      if (start < bytes.Length)
+        args.Add(Encoding.UTF8.GetString(bytes, start, bytes.Length - start));
+      return args.ToArray();
+    }
+
+    static string NormalizeProjectPath(string value)
+    {
+      if (string.IsNullOrWhiteSpace(value))
+        return null;
+
+      try
+      {
+        return FullPathStatic(value.Trim().Trim('"'))
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            .Replace('\\', '/');
+      }
+      catch
+      {
+        return null;
+      }
+    }
+
+    static string FullPathStatic(string path)
+    {
+      return Path.GetFullPath(Environment.ExpandEnvironmentVariables(path));
     }
 
     static string FindRepositoryRoot()
@@ -1758,7 +2051,20 @@ namespace UnityDebugAdapter
     static void EnsureSuccess(JObject response)
     {
       if ((bool?)response["success"] != true)
-        throw new InvalidOperationException("DAP request failed: " + response.ToString(Formatting.None));
+        throw new DapRequestFailedException(response);
+    }
+
+    sealed class DapRequestFailedException : InvalidOperationException
+    {
+      public JObject Response { get; }
+      public string Command { get; }
+
+      public DapRequestFailedException(JObject response)
+          : base("DAP request failed: " + response.ToString(Formatting.None))
+      {
+        Response = response;
+        Command = (string)response["command"];
+      }
     }
 
     static string FindUnityExe()
@@ -1794,6 +2100,7 @@ namespace UnityDebugAdapter
     readonly string m_LogPath;
     readonly double m_RequestTimeoutSeconds;
     readonly BlockingCollection<JObject> m_Messages = new BlockingCollection<JObject>();
+    readonly Queue<JObject> m_PendingEvents = new Queue<JObject>();
     int m_Seq = 1;
     Process m_Process;
 
@@ -1886,6 +2193,10 @@ namespace UnityDebugAdapter
 
     public JObject WaitEvent(string eventName, double timeoutSeconds)
     {
+      var pendingEvent = TakePendingEvent(eventName);
+      if (pendingEvent != null)
+        return pendingEvent;
+
       var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
       while (DateTime.UtcNow < deadline)
       {
@@ -1897,10 +2208,11 @@ namespace UnityDebugAdapter
           continue;
         }
 
-        Record(message);
+        var isTargetEvent = (string)message["type"] == "event" && (string)message["event"] == eventName;
+        Record(message, bufferEvent: !isTargetEvent);
         if ((string)message["type"] == "event" && (string)message["event"] == "terminated")
           throw new TimeoutException("debuggee terminated while waiting for event");
-        if ((string)message["type"] == "event" && (string)message["event"] == eventName)
+        if (isTargetEvent)
           return message;
       }
 
@@ -1966,6 +2278,8 @@ namespace UnityDebugAdapter
       try
       {
         m_Process.Kill();
+        m_Process.WaitForExit(2000);
+        m_Process.Dispose();
       }
       catch { }
     }
@@ -2005,7 +2319,7 @@ namespace UnityDebugAdapter
         StderrLines.Add(line);
     }
 
-    void Record(JObject message)
+    void Record(JObject message, bool bufferEvent = true)
     {
       Transcript.Add(new JObject
       {
@@ -2014,7 +2328,37 @@ namespace UnityDebugAdapter
         ["message"] = message.DeepClone()
       });
       if ((string)message["type"] == "event")
-        Events.Add((JObject)message.DeepClone());
+      {
+        var eventCopy = (JObject)message.DeepClone();
+        Events.Add(eventCopy);
+        if (bufferEvent)
+          m_PendingEvents.Enqueue((JObject)eventCopy.DeepClone());
+      }
+    }
+
+    JObject TakePendingEvent(string eventName)
+    {
+      var skippedEvents = new List<JObject>();
+      JObject matchingEvent = null;
+      while (m_PendingEvents.Count > 0)
+      {
+        var pendingEvent = m_PendingEvents.Dequeue();
+        if (matchingEvent == null && (string)pendingEvent["event"] == eventName)
+        {
+          matchingEvent = pendingEvent;
+          break;
+        }
+        skippedEvents.Add(pendingEvent);
+      }
+
+      var remainingEvents = m_PendingEvents.ToArray();
+      m_PendingEvents.Clear();
+      foreach (var skippedEvent in skippedEvents)
+        m_PendingEvents.Enqueue(skippedEvent);
+      foreach (var remainingEvent in remainingEvents)
+        m_PendingEvents.Enqueue(remainingEvent);
+
+      return matchingEvent;
     }
 
     static byte[] ReadUntil(Stream stream, byte[] marker)

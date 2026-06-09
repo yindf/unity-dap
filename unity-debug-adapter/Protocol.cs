@@ -351,6 +351,9 @@ namespace UnityDebugAdapter
     public ushort? port;
 
     /// <summary> Extension property (not part of DAP). </summary>
+    public double? attachReadyTimeoutSeconds;
+
+    /// <summary> Extension property (not part of DAP). </summary>
     public ExceptionOptions[] __exceptionOptions = null;
 
     /**

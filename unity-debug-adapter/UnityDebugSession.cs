@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -14,9 +15,21 @@ namespace UnityDebugAdapter
   {
     public class UnityDebuggerSession : SoftDebuggerSession
     {
+      public void DetachSynchronously()
+      {
+        try
+        {
+          base.OnDetach();
+        }
+        catch (Exception e)
+        {
+          Logger.LogWarn("UnityDebuggerSession: synchronous detach failed: " + e);
+        }
+      }
+
       protected override void OnExit()
       {
-        Detach();
+        DetachSynchronously();
       }
     }
 
@@ -371,11 +384,18 @@ namespace UnityDebugAdapter
 
       SetExceptionBreakpoints(attachArgs.__exceptionOptions);
 
+      var attachReadyTimeoutSeconds = Math.Max(1.0, Math.Min(300.0, attachArgs.attachReadyTimeoutSeconds ?? 20.0));
+      Logger.LogInfo("UnityDebugSession: attach begin command={0}, address={1}, port={2}, readyTimeoutSeconds={3}",
+          command,
+          address,
+          port,
+          attachReadyTimeoutSeconds);
+
       m_AttachReadyEvent.Reset();
       Connect(address, port);
 
       SendOutput("stdout", $"UnityDebugAdapter: attached to Unity Mono runtime endpoint via {address}:{port}");
-      if (!m_AttachReadyEvent.Wait(TimeSpan.FromSeconds(20)))
+      if (!WaitForAttachReady(TimeSpan.FromSeconds(attachReadyTimeoutSeconds)))
       {
         var connected = m_Session?.IsConnected ?? false;
         var running = m_Session?.IsRunning ?? false;
@@ -397,6 +417,37 @@ namespace UnityDebugAdapter
       }
 
       return true;
+    }
+
+    bool WaitForAttachReady(TimeSpan timeout)
+    {
+      var stopwatch = Stopwatch.StartNew();
+      var nextLogAt = TimeSpan.FromSeconds(5);
+      while (stopwatch.Elapsed < timeout)
+      {
+        var remaining = timeout - stopwatch.Elapsed;
+        var wait = remaining < TimeSpan.FromMilliseconds(500)
+            ? remaining
+            : TimeSpan.FromMilliseconds(500);
+        if (m_AttachReadyEvent.Wait(wait))
+        {
+          Logger.LogInfo("UnityDebugSession: attach ready after {0:F1}s", stopwatch.Elapsed.TotalSeconds);
+          return true;
+        }
+
+        if (stopwatch.Elapsed >= nextLogAt)
+        {
+          Logger.LogInfo(
+              "UnityDebugSession: still waiting for TargetReady after {0:F1}s. connected={1}, running={2}, exited={3}",
+              stopwatch.Elapsed.TotalSeconds,
+              m_Session?.IsConnected ?? false,
+              m_Session?.IsRunning ?? false,
+              m_Session?.HasExited ?? false);
+          nextLogAt += TimeSpan.FromSeconds(5);
+        }
+      }
+
+      return false;
     }
 
 
@@ -455,8 +506,10 @@ namespace UnityDebugAdapter
           m_DebuggeeExecuting = true;
           m_Breakpoints = null;
           m_Session.Breakpoints.Clear();
-          m_Session.Continue();
-          m_Session.Detach();
+          if (m_Session is UnityDebuggerSession unitySession)
+            unitySession.DetachSynchronously();
+          else
+            m_Session.Detach();
           m_Session.Adaptor.Dispose();
           m_Session = null;
         }
