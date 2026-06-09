@@ -1,76 +1,26 @@
-# About
+# Unity Debug Adapter
 
-Unity Debug Adapter (DA) for debugging the Unity Editor or applications using the Mono scripting
-backend.
+Unity Debug Adapter is a Mono-based Unity debugger with two entry points:
+
+- A standard Debug Adapter Protocol (DAP) server for editors.
+- A stdio MCP server for coding agents and LLM tools.
+
+The MCP mode is the main agent-facing workflow. It lets an agent attach to a
+running Unity Editor, set breakpoints, enter Play Mode, wait for a stop, inspect
+stack frames and variables, continue or step, and cleanly detach without mixing
+debug protocol traffic into the MCP stream.
 
 > [!IMPORTANT]
-> debugging IL2CPP applications is not and will not be supported.
+> IL2CPP debugging is not supported. This adapter targets the Mono scripting
+> backend used by the Unity Editor and Mono players with debugging enabled.
 
-This project is adjusted (forked) from the deprecated and *quite frankly* bloated
-[vscode-unity-debug][vscode-unity-debug] project.
+This project is a fork of the deprecated
+[vscode-unity-debug][vscode-unity-debug] project, trimmed down for direct DAP
+and MCP use.
 
-If you are doing Unity development on a text-editor/IDE other than VSCode,
-Ryder, or Visual Studio, and you want debugging functionalities with a
-permissive license (MIT) then this project is for you.
+## Agent Debugging With MCP
 
-In case you are looking for instructions on how to hook this to Neovim, see
-[neovim-unity][unity-debugger-support].
-
-## Build from Source
-
-Clone the repo and its submodule(s):
-
-```bash
-git clone --recurse-submodules https://github.com/walcht/unity-dap.git
-cd unity-dap/
-```
-
-Then build using dotnet (tested on dotnet 9.0.108, on Ubuntu 24.04):
-
-```bash
-dotnet build --configuration=Release unity-debug-adapter/unity-debug-adapter.csproj
-```
-
-If you get build error messages related to `Microsoft.SymbolStore` and `Microsoft.FileFormats`
-such as these:
-
-```bash
-/unity-dap/unity-debug-adapter/unity-debug-adapter.csproj : error NU1101: Unable to find package Microsoft.SymbolStore. No packages exist with this id in source(s): nuget.org
-/unity-dap/unity-debug-adapter/unity-debug-adapter.csproj : error NU1101: Unable to find package Microsoft.FileFormats. No packages exist with this id in source(s): nuget.org
-```
-
-Then make sure to add outdated packages as a source for Nuget and then run the build command
-again (the error is not caused by this project but rather its Mono debugger dependency -
-see [this issue](https://github.com/mono/debugger-libs/issues/402)):
-
-```bash
-dotnet nuget add source 'https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet-tools/nuget/v3/index.json' -n "OutdatedPackages"
-```
-
-Then, if you want to run the debug adapter:
-
-```bash
-bin/Release/unity-debug-adapter.exe
-```
-
-  If you built this from source, you might need to:
-  ```bash
-  chmod +x bin/Release/unity-debug-adapter.exe
-  ```
-
-You should then get an output like this:
-
-```text
-21/08/2025 00:31:01 [I] waiting for debug protocol on stdin/stdout
-21/08/2025 00:31:01 [I] constructing UnityDebugSession
-21/08/2025 00:31:01 [I] done constructing UnityDebugSession
-```
-
-## MCP Mode for LLM Debugging
-
-The same executable can also run as a stdio MCP server. This lets an MCP client
-or LLM agent start Unity, attach to a running Editor, set breakpoints, control
-Play Mode, and inspect stopped frames through the same debug adapter binary:
+Run the adapter as an MCP server:
 
 ```bash
 bin/Release/unity-debug-adapter.exe --mcp --log-level=info
@@ -89,29 +39,75 @@ Example MCP client configuration:
 }
 ```
 
-The MCP server starts a child instance of this executable in normal DAP mode
-for each debug session. This avoids mixing MCP and DAP messages on one
-stdin/stdout stream, and it isolates adapter shutdown from the MCP server.
-Session logs are written under `bin/Release/mcp-logs/<sessionId>/`.
+The MCP server starts a child copy of the same executable in normal DAP mode
+for each debug session. That keeps MCP JSON-RPC and DAP messages on separate
+stdio streams and lets the adapter process exit after `disconnect` while the
+MCP server remains available for another attach.
 
-Available tools:
+Session logs are written to:
 
-- `unity_debug_session`: create, attach, detach, disconnect, reset, or clean up
-  debug sessions. `attach` can use an explicit `unityPid`, reuse the active
-  Unity process, or auto-select a single running Unity Editor for the project.
-- `unity_debug_breakpoints`: set, add, remove, update, clear, or list source
-  breakpoints. Breakpoint specs support lines, conditions, hit conditions, and
-  log messages.
-- `unity_debug_control`: enter Play Mode, wait for stopped events, capture
-  stack/scope/variable snapshots, continue, step, pause, or run Unity tests.
-- `unity_debug_status`: inspect session state, breakpoints, or diagnostic log
-  tails.
+```text
+bin/Release/mcp-logs/<sessionId>/
+```
 
-For the repository E2E fixture, a minimal interactive flow is:
+Each session directory contains adapter logs, Unity logs when Unity is started
+by MCP, and a DAP transcript.
+
+## MCP Tools
+
+`unity_debug_session`
+
+Manage the Unity debug session. Supported actions include `status`, `attach`,
+`detach`, `disconnect`, `reset`, `cleanup`, `start`, and `prepare`.
+
+Use `attach` with:
+
+- `unityPid` when the target Unity process is known.
+- no `unityPid` when one matching Unity Editor is already running.
+- `projectPath` to prefer the Unity process opened for that project.
+
+`unity_debug_breakpoints`
+
+Set, add, remove, update, clear, or list source breakpoints. Breakpoint specs
+support:
+
+- `line`
+- `column`
+- `condition`
+- `hitCondition`
+- `logMessage`
+
+`unity_debug_control`
+
+Control the debuggee and collect state. Supported actions include `enterPlay`,
+`enterPlayAndStop`, `wait`, `snapshot`, `continue`, `next`, `stepIn`,
+`stepOut`, `pause`, `resumeUntilStopped`, and `runTests`.
+
+`snapshot` returns the current stopped thread, top frame, stack frames, scopes,
+locals, and optional expression evaluations.
+
+`unity_debug_status`
+
+Inspect the active session, breakpoint state, or diagnostic logs. Use
+`action: "diagnose"` to include recent adapter and Unity log lines.
+
+## Minimal Agent Flow
+
+For the repository E2E fixture, an agent can attach, set a breakpoint, enter
+Play Mode, and inspect variables with these tool calls.
+
+Attach to a running Unity Editor or auto-select the single matching Editor:
 
 ```json
-{ "name": "unity_debug_session", "arguments": { "action": "attach" } }
+{
+  "name": "unity_debug_session",
+  "arguments": {
+    "action": "attach"
+  }
+}
 ```
+
+Set a breakpoint in the default fixture `TestScript.cs`:
 
 ```json
 {
@@ -123,103 +119,147 @@ For the repository E2E fixture, a minimal interactive flow is:
 }
 ```
 
-```json
-{ "name": "unity_debug_control", "arguments": { "action": "enterPlay" } }
-```
+Enter Play Mode:
 
 ```json
-{ "name": "unity_debug_control", "arguments": { "action": "wait" } }
+{
+  "name": "unity_debug_control",
+  "arguments": {
+    "action": "enterPlay"
+  }
+}
 ```
+
+Wait for a stopped event:
+
+```json
+{
+  "name": "unity_debug_control",
+  "arguments": {
+    "action": "wait",
+    "timeoutSeconds": 60
+  }
+}
+```
+
+Capture the current frame and evaluate expressions:
 
 ```json
 {
   "name": "unity_debug_control",
   "arguments": {
     "action": "snapshot",
-    "expressions": ["this", "m_Radius", "s_StaticBoolVar", "transform.position"]
+    "expressions": [
+      "this",
+      "m_Radius",
+      "s_StaticBoolVar",
+      "transform.position"
+    ]
   }
 }
 ```
 
-When Unity Hub's licensing helper is holding Unity's licensing mutex, pass
-`"killUnityHubLicensing": true`. This kills `Unity Hub` and
-`Unity.Licensing.Client`, so use it only when the editor exits during startup
-with a licensing conflict.
+Detach the DAP adapter client while keeping Unity open:
 
-## For Developers
-
-This section is mainly for developers interested in contributing or want to
-learn the intenals of this project.
-
-### Overview
-
-```
-                    Translates `requests` from nvim (which are DAP conformant)
-                    to Mono.Debugger-sepecific requests.
-                    Translates Mono.Debugger-specific
-                    responses to DAP-conformant `responses`.
-                    Writes logs to s_LogFile or stderr              Locally running Unity Editor (which always uses Mono). Or
-                              |                                     a local/remote running Unity Player instance using Mono
-                              |                                                 backend (with debugging enabled)
-                              |                                                             |
-    +------+            +-----------+                  +--------------------+ <  - - - - -  +
-    | Nvim |----------- | UNITY DAP | ---------------- |       UNITY        |
-    +------+     ^      +-----------+        ^         |   (Mono.Debugger)  |
-                 |                           |         +--------------------+
-                 |                           |
-         via stdin and stdout                + via a TCP/IP socket (ip:port)
-         (_outputStream and inputStream)
+```json
+{
+  "name": "unity_debug_session",
+  "arguments": {
+    "action": "detach"
+  }
+}
 ```
 
-### Backends
+Use `cleanup` when the agent owns the Unity process and should close it, or
+when interrupted sessions need to be torn down explicitly.
 
-This debug adapter essentially communicates with the following backends:
+## Agent-Oriented Behavior
 
-- Mono.Debugger.Soft: this is the official Mono debugger in `debugger-libs`.
-- GDB: Mono applications can be debugged using `gdb`. This is still not
-implemented yet and is TODO.
+The MCP server is designed for repeated tool-driven debugging loops:
 
+- Re-attaching to an already running Unity Editor is supported.
+- Detach keeps Unity process identity, port, tracked breakpoints, and session
+  metadata until explicit cleanup or reset.
+- The DAP child process is not reused after disconnect; a later attach starts a
+  fresh DAP adapter client.
+- Breakpoints can be supplied during attach or synchronized later with
+  `unity_debug_breakpoints`.
+- If multiple Unity Editors are running, pass `unityPid` or `projectPath` so the
+  agent does not attach to the wrong process.
 
-### Why not IL2CPP
+If Unity Hub's licensing helper is holding Unity's licensing mutex, pass
+`killUnityHubLicensing: true` to session start or attach flows that launch
+Unity. This kills `Unity Hub` and `Unity.Licensing.Client`, so use it only when
+Unity exits during startup with a licensing conflict.
 
-I will not include add support for debugging C# -> IL2CPP code mainly because
-of these facts/opinions:
+## Standard DAP Mode
 
-- IL2CPP is closed source and I might get into trouble if I implement something
-like what Visual Studio does (i.e., some sort of mapping between original C#
-code and generated IL2CPP C++ code).
-- I think it makes little sense to debug C++ code (generated or not) via
-stepping through a completely different language (e.g., managed C#).
-- Complexity. There are very few people who are using Neovim for Unity, fewer
-are using debuggers, and even fewer who want to debug IL2CPP through C# via
-Neovim. This is simply not worth the effort.
-- IL2CPP is simply C++. Just debug it using a proper C++ debugger (e.g., gdb).
+Run without `--mcp` to start the standard debug adapter over stdin/stdout:
 
-### Why Not Use [vscode-unity-debug][vscode-unity-debug]?
+```bash
+bin/Release/unity-debug-adapter.exe --log-level=info
+```
 
-[vscode-unity-debug][vscode-unity-debug] does not work out-of-the-box with new
-dotnet because of failure to detect the '\r\n\r\n' sequence in
-client <-> debug-adapter messages. The failure is caused by an
-`IndexOf("\r\n\r\n")` issue (see https://github.com/dotnet/runtime/issues/43736).
+This mode is intended for DAP clients such as Neovim integrations. For Neovim
+setup, see [neovim-unity][unity-debugger-support].
 
-Since the project is stale and no longer accepts pull-requests/patches, fixing
-issues of the original [vscode-unity-debug][vscode-unity-debug] project and
-debloating it are the reasons for the existence of this project.
+## Build From Source
 
-The project is also very poorly written, all responses are sent twice, the
-project relies on heavy usage of the `dynamic` keyword which requires JIT and
-which causes issues when this project is compiled with dotnet (rather than
-xbuild).
+Clone the repository with submodules:
 
+```bash
+git clone --recurse-submodules https://github.com/walcht/unity-dap.git
+cd unity-dap/
+```
 
-### In an Ideal World
+Build with dotnet:
 
-Hopefully we get Unity .NET CLR support before the sun explodes so that we can
-use actual proper, industry-standard, open-source, and actively maintained
-.NET debuggers.
+```bash
+dotnet build --configuration=Release unity-debug-adapter/unity-debug-adapter.csproj
+```
 
-When that happens, this adapter will add support to it and will, probably, be
-much more useful.
+If restore fails for `Microsoft.SymbolStore` or `Microsoft.FileFormats`, add
+the legacy package source required by the Mono debugger dependency:
+
+```bash
+dotnet nuget add source 'https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet-tools/nuget/v3/index.json' -n "OutdatedPackages"
+```
+
+Then run the build again.
+
+On Unix-like systems, if the generated executable is not marked executable:
+
+```bash
+chmod +x bin/Release/unity-debug-adapter.exe
+```
+
+## Developer Notes
+
+The adapter communicates with Unity through `Mono.Debugger.Soft` from
+`debugger-libs`. GDB support is not implemented.
+
+The DAP implementation translates editor or MCP-driven DAP requests into
+Mono.Debugger requests, then converts debugger events and responses back into
+DAP responses.
+
+```
+    MCP client / DAP client
+              |
+              | stdin/stdout
+              v
+    Unity Debug Adapter
+              |
+              | TCP socket
+              v
+    Unity Editor / Mono runtime
+```
+
+## Why Not IL2CPP
+
+IL2CPP is not supported because it is a C++ backend, not a managed Mono runtime.
+Debugging generated C++ through C# source mapping would add substantial
+complexity and is outside the scope of this adapter. Use a C++ debugger for
+IL2CPP targets.
 
 ## License
 
