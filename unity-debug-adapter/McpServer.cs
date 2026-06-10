@@ -156,7 +156,7 @@ namespace UnityDebugAdapter
                 Prop("action", "string", "status, breakpoints, diagnose. Default status."),
                 Prop("sessionId", "string", "Session id. Defaults to the active session."),
                 Prop("sourcePath", "string", "Optional source path filter for breakpoints."),
-                Prop("tailLines", "integer", "Number of log lines for diagnose. Default 80.")
+                Prop("tailLines", "integer", "Number of log lines for diagnose. Default 30.")
               ))
         }
       };
@@ -655,7 +655,7 @@ namespace UnityDebugAdapter
       {
         var f = frames[i];
         var name = f["name"] ?? "?";
-        var sourceName = f["source"]?["name"] ?? "";
+        var sourceName = (f["source"] as JObject)?["name"] ?? "";
         var line = f["line"] ?? "";
         sb.AppendLine($"{i + 1}. `{name}` — {sourceName}:{line}");
       }
@@ -689,8 +689,8 @@ namespace UnityDebugAdapter
       foreach (var kvp in evaluations)
       {
         var body = kvp.Value as JObject;
-        var result = body?["result"] ?? "";
-        var childRef = (int?)(body?["variablesReference"]);
+        var result = (body as JObject)?["result"] ?? "";
+        var childRef = (int?)((body as JObject)?["variablesReference"]);
         var children = childRef.HasValue && childRef.Value > 0 ? "yes" : "—";
         sb.AppendLine($"| {EscapeMd(kvp.Key)} | `{EscapeMd(result)}` | {children} |");
       }
@@ -704,11 +704,34 @@ namespace UnityDebugAdapter
       foreach (var bp in breakpoints)
       {
         var sourcePath = (string)bp["sourcePath"];
-        var lines = bp["lines"] as JArray;
         var fileName = string.IsNullOrEmpty(sourcePath) ? "?" : Path.GetFileName(sourcePath);
-        var lineStr = lines != null && lines.Count > 0 ? string.Join(", ", lines) : "(none)";
         sb.AppendLine($"**{fileName}**");
-        sb.AppendLine($"  Lines: {lineStr}");
+
+        var specs = bp["breakpoints"] as JArray;
+        if (specs != null && specs.Count > 0)
+        {
+          foreach (var spec in specs)
+          {
+            var line = spec["line"];
+            var parts = new List<string> { $"L{line}" };
+            var condition = (string)spec["condition"];
+            var hitCondition = (string)spec["hitCondition"];
+            var logMessage = (string)spec["logMessage"];
+            if (!string.IsNullOrEmpty(condition))
+              parts.Add($"cond: {condition}");
+            if (!string.IsNullOrEmpty(hitCondition))
+              parts.Add($"hit: {hitCondition}");
+            if (!string.IsNullOrEmpty(logMessage))
+              parts.Add($"log: {logMessage}");
+            sb.AppendLine($"  {string.Join(" | ", parts)}");
+          }
+        }
+        else
+        {
+          var lines = bp["lines"] as JArray;
+          var lineStr = lines != null && lines.Count > 0 ? string.Join(", ", lines) : "(none)";
+          sb.AppendLine($"  Lines: {lineStr}");
+        }
       }
       return sb.ToString();
     }
@@ -749,7 +772,7 @@ namespace UnityDebugAdapter
         string firstSourcePath = null;
         foreach (var sync in bpSync)
         {
-          var resp = sync["response"]?["breakpoints"] as JArray;
+          var resp = (sync["response"] as JObject)?["breakpoints"] as JArray;
           if (resp != null) foreach (var bp in resp) allBps.Add(bp);
           if (firstSourcePath == null)
             firstSourcePath = (string)sync["sourcePath"];
@@ -794,7 +817,7 @@ namespace UnityDebugAdapter
           string firstSourcePath = null;
           foreach (var sync in bpSync)
           {
-            var resp = sync["response"]?["breakpoints"] as JArray;
+            var resp = (sync["response"] as JObject)?["breakpoints"] as JArray;
             if (resp != null) foreach (var bp in resp) allBps.Add(bp);
             if (firstSourcePath == null)
               firstSourcePath = (string)sync["sourcePath"];
@@ -831,6 +854,19 @@ namespace UnityDebugAdapter
       var sb = new StringBuilder();
       sb.AppendLine("### Detached");
       sb.AppendLine(BoldKV("Session", $"`{obj["sessionId"]}`"));
+      var detached = obj["detached"];
+      if (detached != null)
+        sb.AppendLine(BoldKV("DAP disconnect sent", BoolYesNo(detached)));
+      var continued = obj["continued"];
+      if (continued != null)
+      {
+        var continuedObj = continued as JObject;
+        if (continuedObj != null && continuedObj["error"] != null)
+          sb.AppendLine(BoldKV("Continue before detach", $"failed: {continuedObj["error"]}"));
+        else
+          sb.AppendLine(BoldKV("Continued before detach", "yes"));
+      }
+      sb.AppendLine("> Session record preserved. Use `status` to check or `attach` to reconnect.");
       return sb.ToString().TrimEnd();
     }
 
@@ -943,14 +979,36 @@ namespace UnityDebugAdapter
       }
       else
       {
-        var respBps = obj["response"]?["breakpoints"] as JArray;
+        var respBps = (obj["response"] as JObject)?["breakpoints"] as JArray;
+        var trackedSpecs = obj["breakpoints"] as JArray;
+        var hasDetails = trackedSpecs != null && trackedSpecs.Count > 0 &&
+            trackedSpecs.Any(s => !string.IsNullOrEmpty((string)s["condition"]) ||
+                                  !string.IsNullOrEmpty((string)s["hitCondition"]) ||
+                                  !string.IsNullOrEmpty((string)s["logMessage"]));
         if (respBps != null && respBps.Count > 0)
         {
           sb.AppendLine();
-          sb.AppendLine("| Line | Verified |");
-          sb.AppendLine("|------|----------|");
-          foreach (var bp in respBps)
-            sb.AppendLine($"| {bp["line"]} | {BoolYesNo(bp["verified"])} |");
+          if (hasDetails)
+          {
+            sb.AppendLine("| Line | Verified | Condition | Hit | Log |");
+            sb.AppendLine("|------|----------|-----------|-----|-----|");
+            foreach (var bp in respBps)
+            {
+              var line = (int?)bp["line"] ?? 0;
+              var spec = trackedSpecs?.FirstOrDefault(s => (int?)s["line"] == line);
+              var cond = (string)spec?["condition"] ?? "";
+              var hit = (string)spec?["hitCondition"] ?? "";
+              var log = (string)spec?["logMessage"] ?? "";
+              sb.AppendLine($"| {line} | {BoolYesNo(bp["verified"])} | {EscapeMd(cond)} | {EscapeMd(hit)} | {EscapeMd(log)} |");
+            }
+          }
+          else
+          {
+            sb.AppendLine("| Line | Verified |");
+            sb.AppendLine("|------|----------|");
+            foreach (var bp in respBps)
+              sb.AppendLine($"| {bp["line"]} | {BoolYesNo(bp["verified"])} |");
+          }
         }
       }
       return sb.ToString().TrimEnd();
@@ -1021,7 +1079,7 @@ namespace UnityDebugAdapter
 
       if (topFrame != null)
       {
-        var sourceName = (string)(topFrame["source"]?["name"] ?? "");
+        var sourceName = (string)((topFrame["source"] as JObject)?["name"] ?? "");
         var line = topFrame["line"] ?? "";
         sb.AppendLine($"{BoldKV("File", $"{sourceName}:{line}")} | {BoldKV("Reason", reason)}");
       }
@@ -1087,7 +1145,7 @@ namespace UnityDebugAdapter
       var command = (string)obj["command"] ?? "step";
       var stopped = obj["stopped"] as JObject;
       var threadId = stopped?["threadId"] ?? obj["threadId"];
-      var reason = stopped?["reason"] ?? obj["stopped"]?["body"]?["reason"];
+      var reason = stopped?["reason"] ?? (obj["stopped"] as JObject)?["body"]?["reason"];
 
       sb.AppendLine($"### Step ({command}) — Thread {threadId}");
       sb.AppendLine(BoldKV("Reason", reason));
@@ -1115,7 +1173,7 @@ namespace UnityDebugAdapter
     {
       var sb = new StringBuilder();
       var command = (string)obj["command"] ?? "step";
-      var allContinued = obj["response"]?["allThreadsContinued"];
+      var allContinued = (obj["response"] as JObject)?["allThreadsContinued"];
       if (command == "continue")
       {
         sb.AppendLine("### Continue");
@@ -1195,7 +1253,7 @@ namespace UnityDebugAdapter
       var sb = new StringBuilder();
       sb.AppendLine("### Continued");
       var continued = obj["continued"] as JObject;
-      var allContinued = continued?["response"]?["allThreadsContinued"];
+      var allContinued = (continued?["response"] as JObject)?["allThreadsContinued"];
       sb.AppendLine(BoldKV("All threads continued", BoolYesNo(allContinued)));
 
       var stopped = obj["stopped"] as JObject;
@@ -1674,7 +1732,7 @@ namespace UnityDebugAdapter
           m_SourcePath = FullPath(Path.Combine(m_ProjectPath, "Assets", "Scripts", "TestScript.cs"));
       }
       if (args["sourcePath"] != null)
-        m_SourcePath = FullPath((string)args["sourcePath"]);
+        m_SourcePath = SourceFullPath((string)args["sourcePath"]);
       if (args["unityExe"] != null)
         m_UnityExe = (string)args["unityExe"];
       if (args["killUnityHubLicensing"] != null)
@@ -1738,14 +1796,14 @@ namespace UnityDebugAdapter
 
     public object SetBreakpoints(JObject args)
     {
-      var sourcePath = FullPath((string)args["sourcePath"] ?? m_SourcePath);
+      var sourcePath = SourceFullPath((string)args["sourcePath"] ?? m_SourcePath);
       m_BreakpointsBySource[sourcePath] = ReadBreakpointSpecs(args, requireBreakpoints: true);
       return SyncBreakpoints(sourcePath);
     }
 
     public object AddBreakpoints(JObject args)
     {
-      var sourcePath = FullPath((string)args["sourcePath"] ?? m_SourcePath);
+      var sourcePath = SourceFullPath((string)args["sourcePath"] ?? m_SourcePath);
       var tracked = GetTrackedBreakpoints(sourcePath);
       foreach (var breakpoint in ReadBreakpointSpecs(args, requireBreakpoints: true).Values)
         tracked[breakpoint.Line] = breakpoint;
@@ -1754,7 +1812,7 @@ namespace UnityDebugAdapter
 
     public object RemoveBreakpoints(JObject args)
     {
-      var sourcePath = FullPath((string)args["sourcePath"] ?? m_SourcePath);
+      var sourcePath = SourceFullPath((string)args["sourcePath"] ?? m_SourcePath);
       var lineSet = ReadLineSet(args, requireLines: true);
       var tracked = GetTrackedBreakpoints(sourcePath);
       foreach (var line in lineSet)
@@ -1764,7 +1822,7 @@ namespace UnityDebugAdapter
 
     public object UpdateBreakpoint(JObject args)
     {
-      var sourcePath = FullPath((string)args["sourcePath"] ?? m_SourcePath);
+      var sourcePath = SourceFullPath((string)args["sourcePath"] ?? m_SourcePath);
       var oldLine = (int?)args["oldLine"];
       var newLine = (int?)args["newLine"];
       if (!oldLine.HasValue || oldLine.Value <= 0)
@@ -1790,7 +1848,7 @@ namespace UnityDebugAdapter
       var explicitSourcePath = (string)args["sourcePath"];
       if (!string.IsNullOrWhiteSpace(explicitSourcePath))
       {
-        var sourcePath = FullPath(explicitSourcePath);
+        var sourcePath = SourceFullPath(explicitSourcePath);
         m_BreakpointsBySource[sourcePath] = new SortedDictionary<int, McpBreakpointSpec>();
         return SyncBreakpoints(sourcePath);
       }
@@ -1815,7 +1873,7 @@ namespace UnityDebugAdapter
       var explicitSourcePath = (string)args["sourcePath"];
       if (!string.IsNullOrWhiteSpace(explicitSourcePath))
       {
-        var sourcePath = FullPath(explicitSourcePath);
+        var sourcePath = SourceFullPath(explicitSourcePath);
         return new
         {
           sessionId = SessionId,
@@ -2116,7 +2174,7 @@ namespace UnityDebugAdapter
       });
       EnsureSuccess(stack);
 
-      var frames = stack["body"]?["stackFrames"] as JArray ?? new JArray();
+      var frames = (stack["body"] as JObject)?["stackFrames"] as JArray ?? new JArray();
       var scopes = new JArray();
       var variables = new JArray();
       var evaluations = new JObject();
@@ -2129,7 +2187,7 @@ namespace UnityDebugAdapter
       {
         var scopesResponse = m_Client.Request("scopes", new JObject { ["frameId"] = frameId.Value });
         EnsureSuccess(scopesResponse);
-        scopes = scopesResponse["body"]?["scopes"] as JArray ?? new JArray();
+        scopes = (scopesResponse["body"] as JObject)?["scopes"] as JArray ?? new JArray();
 
         foreach (var scope in scopes)
         {
@@ -2138,7 +2196,7 @@ namespace UnityDebugAdapter
             continue;
           var variablesResponse = m_Client.Request("variables", new JObject { ["variablesReference"] = reference });
           EnsureSuccess(variablesResponse);
-          foreach (var variable in variablesResponse["body"]?["variables"] as JArray ?? new JArray())
+          foreach (var variable in (variablesResponse["body"] as JObject)?["variables"] as JArray ?? new JArray())
             variables.Add(variable);
         }
 
@@ -2186,7 +2244,7 @@ namespace UnityDebugAdapter
       {
         sessionId = SessionId,
         command = "continue",
-        response = response["body"]
+        response = response["body"] is JObject bodyObj ? bodyObj : new JObject()
       };
     }
 
@@ -2226,6 +2284,7 @@ namespace UnityDebugAdapter
       var response = m_Client.Request(command, requestArgs);
       EnsureSuccess(response);
       SaveTranscript();
+      var responseBody = response["body"] is JObject bodyObj ? bodyObj : new JObject();
 
       var waitForStop = (bool?)args["waitForStop"] ?? true;
       if (!waitForStop)
@@ -2234,7 +2293,7 @@ namespace UnityDebugAdapter
         {
           sessionId = SessionId,
           command,
-          response = response["body"],
+          response = responseBody,
           status = Status()
         };
       }
@@ -2244,7 +2303,7 @@ namespace UnityDebugAdapter
       {
         sessionId = SessionId,
         command,
-        response = response["body"],
+        response = responseBody,
         stopped = wr.Item1,
         snapshot = wr.Item2,
         status = Status()
@@ -2398,7 +2457,7 @@ namespace UnityDebugAdapter
 
     public object Diagnose(JObject args)
     {
-      var tailLines = Math.Max(1, (int?)args["tailLines"] ?? 80);
+      var tailLines = Math.Max(1, (int?)args["tailLines"] ?? 30);
       return new
       {
         sessionId = SessionId,
@@ -2487,6 +2546,15 @@ namespace UnityDebugAdapter
       if (Path.IsPathRooted(path))
         return Path.GetFullPath(path);
       return Path.GetFullPath(Path.Combine(m_Root, path));
+    }
+
+    string SourceFullPath(string path)
+    {
+      if (string.IsNullOrEmpty(path))
+        return path;
+      if (Path.IsPathRooted(path))
+        return Path.GetFullPath(path);
+      return Path.GetFullPath(Path.Combine(m_ProjectPath, path));
     }
 
     bool EnsureEditorScripts(string projectPath)
@@ -2916,10 +2984,36 @@ namespace UnityDebugAdapter
       public string Command { get; }
 
       public DapRequestFailedException(JObject response)
-          : base("DAP request failed: " + response.ToString(Formatting.None))
+          : base(FormatFriendlyMessage(response))
       {
         Response = response;
         Command = (string)response["command"];
+      }
+
+      static string FormatFriendlyMessage(JObject response)
+      {
+        var command = (string)response["command"] ?? "(unknown)";
+        var error = response["body"]?["error"];
+        var errorId = (int?)error?["id"];
+        var errorFormat = (string)error?["format"];
+
+        // Source-not-found errors (DAP error ids 3011, 7712, or message contains "source")
+        if (errorId == 3011 || errorId == 7712 ||
+            (errorFormat != null && errorFormat.Contains("source") && errorFormat.Contains("not")))
+          return $"Source file not found (command: {command}). " +
+                 "Ensure the file exists and Unity has loaded it (try entering Play Mode first).";
+
+        // Breakpoint-set failures
+        if (errorId == 1104 ||
+            (errorFormat != null && errorFormat.Contains("breakpoint") && errorFormat.Contains("not")))
+          return $"Breakpoint could not be set (command: {command}). " +
+                 "The source location may not exist or may not be loaded by the debugger.";
+
+        // Generic message with the error format if available
+        if (!string.IsNullOrEmpty(errorFormat))
+          return $"Debug adapter error in {command}: {errorFormat}";
+
+        return $"Debug adapter request failed (command: {command})";
       }
     }
 
