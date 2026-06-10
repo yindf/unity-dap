@@ -19,12 +19,19 @@ namespace UnityDebugAdapter
       {
         try
         {
-          base.OnDetach();
+          if (IsConnected)
+            base.OnDetach();
         }
         catch (Exception e)
         {
           Logger.LogWarn("UnityDebuggerSession: synchronous detach failed: " + e);
         }
+
+        // EndSession cancels any pending connection (via EndLaunch) so that
+        // Unity's debugger endpoint is freed. Without this, a failed attach
+        // that never completed the JDWP handshake leaves the TCP socket open
+        // and Unity keeps the stale session, preventing future attach attempts.
+        EndSession();
       }
 
       protected override void OnExit()

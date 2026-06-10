@@ -23,4 +23,11 @@
     <ProjectReference Include="../debugger-libs/Mono.Debugging.Soft/Mono.Debugging.Soft.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Remove="EditorTemplates\McpPlayModeController.cs" />
+    <EmbeddedResource Include="EditorTemplates\McpPlayModeController.cs">
+      <LogicalName>McpPlayModeController.cs</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
 </Project>

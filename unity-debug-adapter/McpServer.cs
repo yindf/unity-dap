@@ -6,6 +6,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Text;
 using System.Threading;
 using Newtonsoft.Json;
@@ -567,12 +568,687 @@ namespace UnityDebugAdapter
           new JObject
           {
             ["type"] = "text",
-            ["text"] = structured.ToString(Formatting.Indented)
+            ["text"] = ToMarkdown(structured)
           }
-        },
-        ["structuredContent"] = structured
+        }
       };
     }
+
+    // ── Markdown formatting ──────────────────────────────────────────
+
+    static string ToMarkdown(JToken token)
+    {
+      if (token == null) return "";
+      var obj = token as JObject;
+      if (obj == null) return token.ToString(Formatting.Indented);
+
+      // Dispatch by detected shape (most specific first)
+      if (obj["cleaned"] != null) return FormatCleanup(obj);
+      if (obj["detached"] != null) return FormatDetach(obj);
+      if (obj["active"] != null && obj["message"] != null) return FormatNoSession(obj);
+      if (obj["adapterLogTail"] != null) return FormatDiagnose(obj);
+      if (obj["active"] != null && obj["start"] != null) return FormatPrepare(obj);
+      if (obj["attached"] != null && obj["unityPid"] != null) return FormatAttach(obj);
+      if (obj["requested"] != null && obj["testMode"] != null) return FormatRunTests(obj);
+      if (obj["enterPlayMode"] != null) return FormatEnterPlayAndStop(obj);
+      if (obj["continued"] != null && obj["stopped"] != null && obj["snapshot"] != null) return FormatResumeUntilStopped(obj);
+      if (obj["requested"] != null && obj["response"] != null) return FormatEnterPlay(obj);
+      if (obj["recentEvents"] != null) return FormatStatus(obj);
+      if (obj["threadId"] != null && obj["topFrame"] != null && obj["stackFrames"] != null && obj["stopped"] == null) return FormatSnapshot(obj);
+      if (obj["stopped"] != null && obj["command"] == null && obj["snapshot"] == null) return FormatWait(obj);
+      if (obj["command"] != null && obj["stopped"] != null && obj["snapshot"] != null) return FormatStepWithStop(obj);
+      if (obj["command"] != null) return FormatStepSimple(obj);
+      if (obj["sourcePath"] != null && obj["responses"] != null) return FormatClearAll(obj);
+      if (obj["sourcePath"] != null && obj["response"] != null) return FormatBreakpointSync(obj);
+      if (obj["sourcePath"] != null) return FormatBreakpointList(obj);
+      if (obj["breakpoints"] != null && obj["sessionId"] != null) return FormatBreakpointListAll(obj);
+      return token.ToString(Formatting.Indented);
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────
+
+    static string BoldKV(string key, object value)
+    {
+      return $"**{key}:** {value}";
+    }
+
+    static string ShortPath(string path)
+    {
+      if (string.IsNullOrEmpty(path)) return "";
+      var name = Path.GetFileName(path);
+      return $"**{name}** — `{path}`";
+    }
+
+    static string FormatStatusOneLine(JToken status)
+    {
+      if (status == null) return "";
+      var attached = BoolYesNo(status["attached"]);
+      var adapter = BoolAlive(status["adapterAlive"], "alive", "dead");
+      var unity = BoolAlive(status["unityAlive"], "alive", "dead");
+      return $"{BoldKV("Attached", attached)} | {BoldKV("Adapter", adapter)} | {BoldKV("Unity", unity)}";
+    }
+
+    static string BoolYesNo(JToken token)
+    {
+      return (bool?)token == true ? "yes" : "no";
+    }
+
+    static string BoolAlive(JToken token, string ifTrue, string ifFalse)
+    {
+      return (bool?)token == true ? ifTrue : ifFalse;
+    }
+
+    static string FormatStoppedOneLine(JToken stopped)
+    {
+      if (stopped == null) return "";
+      var threadId = stopped["threadId"];
+      var reason = stopped["reason"];
+      return $"{BoldKV("Thread", threadId)} | {BoldKV("Reason", reason)}";
+    }
+
+    static string FormatStackFrames(JArray frames)
+    {
+      if (frames == null || frames.Count == 0) return "";
+      var sb = new StringBuilder();
+      sb.AppendLine("### Stack");
+      for (int i = 0; i < frames.Count; i++)
+      {
+        var f = frames[i];
+        var name = f["name"] ?? "?";
+        var sourceName = f["source"]?["name"] ?? "";
+        var line = f["line"] ?? "";
+        sb.AppendLine($"{i + 1}. `{name}` — {sourceName}:{line}");
+      }
+      return sb.ToString();
+    }
+
+    static string FormatVariables(JArray variables)
+    {
+      if (variables == null || variables.Count == 0) return "";
+      var sb = new StringBuilder();
+      sb.AppendLine("### Variables");
+      sb.AppendLine("| Name | Value | Type |");
+      sb.AppendLine("|------|-------|------|");
+      foreach (var v in variables)
+      {
+        var name = v["name"] ?? "";
+        var value = v["value"] ?? "";
+        var type = v["type"] ?? "";
+        sb.AppendLine($"| {EscapeMd(name)} | `{EscapeMd(value)}` | {EscapeMd(type)} |");
+      }
+      return sb.ToString();
+    }
+
+    static string FormatEvaluations(JObject evaluations)
+    {
+      if (evaluations == null || evaluations.Count == 0) return "";
+      var sb = new StringBuilder();
+      sb.AppendLine("### Watch");
+      sb.AppendLine("| Expression | Result | Children |");
+      sb.AppendLine("|------------|--------|----------|");
+      foreach (var kvp in evaluations)
+      {
+        var body = kvp.Value as JObject;
+        var result = body?["result"] ?? "";
+        var childRef = (int?)(body?["variablesReference"]);
+        var children = childRef.HasValue && childRef.Value > 0 ? "yes" : "—";
+        sb.AppendLine($"| {EscapeMd(kvp.Key)} | `{EscapeMd(result)}` | {children} |");
+      }
+      return sb.ToString();
+    }
+
+    static string FormatBreakpointsCompact(JArray breakpoints)
+    {
+      if (breakpoints == null || breakpoints.Count == 0) return "";
+      var sb = new StringBuilder();
+      foreach (var bp in breakpoints)
+      {
+        var sourcePath = (string)bp["sourcePath"];
+        var lines = bp["lines"] as JArray;
+        var fileName = string.IsNullOrEmpty(sourcePath) ? "?" : Path.GetFileName(sourcePath);
+        var lineStr = lines != null && lines.Count > 0 ? string.Join(", ", lines) : "(none)";
+        sb.AppendLine($"**{fileName}**");
+        sb.AppendLine($"  Lines: {lineStr}");
+      }
+      return sb.ToString();
+    }
+
+    static string FormatLogTail(string label, JArray lines, int? tailCount)
+    {
+      if (lines == null || lines.Count == 0)
+        return $"### {label}\n(empty)\n";
+      var count = tailCount ?? lines.Count;
+      var sb = new StringBuilder();
+      sb.AppendLine($"### {label} (last {count})");
+      sb.AppendLine("```");
+      foreach (var line in lines)
+        sb.AppendLine((string)line);
+      sb.AppendLine("```");
+      return sb.ToString();
+    }
+
+    static string EscapeMd(object value)
+    {
+      if (value == null) return "";
+      return value.ToString().Replace("|", "\\|");
+    }
+
+    // ── Formatters ────────────────────────────────────────────────────
+
+    static string FormatAttach(JObject obj)
+    {
+      var sb = new StringBuilder();
+      sb.AppendLine("### Attached");
+      sb.AppendLine(BoldKV("Session", $"`{obj["sessionId"]}`"));
+      sb.AppendLine($"{BoldKV("Unity PID", obj["unityPid"])} | {BoldKV("Port", obj["port"])}");
+
+      var bpSync = obj["breakpointSync"] as JArray;
+      if (bpSync != null && bpSync.Count > 0)
+      {
+        var allBps = new JArray();
+        string firstSourcePath = null;
+        foreach (var sync in bpSync)
+        {
+          var resp = sync["response"]?["breakpoints"] as JArray;
+          if (resp != null) foreach (var bp in resp) allBps.Add(bp);
+          if (firstSourcePath == null)
+            firstSourcePath = (string)sync["sourcePath"];
+        }
+        if (allBps.Count > 0)
+        {
+          sb.AppendLine();
+          sb.AppendLine("### Breakpoints Synced");
+          if (!string.IsNullOrEmpty(firstSourcePath))
+            sb.AppendLine(ShortPath(firstSourcePath));
+          sb.AppendLine("| Line | Verified |");
+          sb.AppendLine("|------|----------|");
+          foreach (var bp in allBps)
+            sb.AppendLine($"| {bp["line"]} | {BoolYesNo(bp["verified"])} |");
+        }
+      }
+
+      var status = obj["status"] as JObject;
+      if (status != null)
+      {
+        sb.AppendLine();
+        sb.AppendLine(FormatStatusOneLine(status));
+      }
+      return sb.ToString().TrimEnd();
+    }
+
+    static string FormatPrepare(JObject obj)
+    {
+      var sb = new StringBuilder();
+      sb.AppendLine("### Session Prepared");
+
+      var start = obj["start"] as JObject;
+      if (start != null)
+      {
+        sb.AppendLine(BoldKV("Session", $"`{start["sessionId"]}`"));
+        sb.AppendLine($"{BoldKV("Unity PID", start["unityPid"])} | {BoldKV("Port", start["port"])}");
+
+        var bpSync = start["breakpointSync"] as JArray;
+        if (bpSync != null && bpSync.Count > 0)
+        {
+          var allBps = new JArray();
+          string firstSourcePath = null;
+          foreach (var sync in bpSync)
+          {
+            var resp = sync["response"]?["breakpoints"] as JArray;
+            if (resp != null) foreach (var bp in resp) allBps.Add(bp);
+            if (firstSourcePath == null)
+              firstSourcePath = (string)sync["sourcePath"];
+          }
+          if (allBps.Count > 0)
+          {
+            sb.AppendLine();
+            sb.AppendLine("### Breakpoints Synced");
+            if (!string.IsNullOrEmpty(firstSourcePath))
+              sb.AppendLine(ShortPath(firstSourcePath));
+            sb.AppendLine("| Line | Verified |");
+            sb.AppendLine("|------|----------|");
+            foreach (var bp in allBps)
+              sb.AppendLine($"| {bp["line"]} | {BoolYesNo(bp["verified"])} |");
+          }
+        }
+      }
+      else
+      {
+        sb.AppendLine(BoldKV("Session", $"`{obj["sessionId"]}`"));
+      }
+
+      var status = obj["status"] as JObject ?? start?["status"] as JObject;
+      if (status != null)
+      {
+        sb.AppendLine();
+        sb.AppendLine(FormatStatusOneLine(status));
+      }
+      return sb.ToString().TrimEnd();
+    }
+
+    static string FormatDetach(JObject obj)
+    {
+      var sb = new StringBuilder();
+      sb.AppendLine("### Detached");
+      sb.AppendLine(BoldKV("Session", $"`{obj["sessionId"]}`"));
+      return sb.ToString().TrimEnd();
+    }
+
+    static string FormatCleanup(JObject obj)
+    {
+      var sb = new StringBuilder();
+      var cleaned = (bool?)obj["cleaned"] == true;
+      sb.AppendLine(cleaned ? "### Cleaned Up" : "### Cleanup");
+      var sessions = obj["sessions"] as JArray;
+      if (sessions != null && sessions.Count > 0)
+        sb.AppendLine(BoldKV("Sessions removed", string.Join(", ", sessions.Select(s => $"`{s}`"))));
+      else if (obj["sessionId"] != null)
+      {
+        var msg = (string)obj["message"];
+        if (!string.IsNullOrEmpty(msg))
+          sb.AppendLine(msg);
+        else
+          sb.AppendLine(BoldKV("Session", $"`{obj["sessionId"]}`"));
+      }
+      return sb.ToString().TrimEnd();
+    }
+
+    static string FormatNoSession(JObject obj)
+    {
+      return $"### Session Status\n{(string)obj["message"]}";
+    }
+
+    static string FormatStatus(JObject obj)
+    {
+      var sb = new StringBuilder();
+      sb.AppendLine("### Session Status");
+      sb.AppendLine(BoldKV("Session", $"`{obj["sessionId"]}`"));
+      sb.AppendLine($"{BoldKV("Unity PID", obj["unityPid"])} | {BoldKV("Port", obj["port"])}");
+      sb.AppendLine(FormatStatusOneLine(obj));
+
+      var lastStopped = obj["lastStopped"] as JObject;
+      if (lastStopped != null)
+      {
+        sb.AppendLine();
+        sb.AppendLine("### Last Stop");
+        sb.AppendLine(FormatStoppedOneLine(lastStopped));
+      }
+
+      var breakpoints = obj["breakpoints"] as JArray;
+      if (breakpoints != null && breakpoints.Count > 0)
+      {
+        sb.AppendLine();
+        sb.AppendLine("### Breakpoints");
+        sb.Append(FormatBreakpointsCompact(breakpoints));
+      }
+
+      var logPaths = new[] { "adapterLogPath", "unityLogPath", "transcriptPath" };
+      var logLabels = new[] { "Adapter", "Unity", "Transcript" };
+      var hasAny = false;
+      for (int i = 0; i < logPaths.Length; i++)
+      {
+        var p = (string)obj[logPaths[i]];
+        if (!string.IsNullOrEmpty(p))
+        {
+          if (!hasAny) { sb.AppendLine(); hasAny = true; }
+          sb.AppendLine($"{BoldKV(logLabels[i], $"`{p}`")}");
+        }
+      }
+
+      var recentEvents = obj["recentEvents"] as JArray;
+      if (recentEvents != null && recentEvents.Count > 0)
+      {
+        sb.AppendLine();
+        sb.AppendLine($"### Recent Events ({recentEvents.Count})");
+        for (int i = 0; i < recentEvents.Count; i++)
+        {
+          var evt = recentEvents[i];
+          var type = (string)evt["event"] ?? "?";
+          var detail = "";
+          if (type == "stopped")
+          {
+            var body = evt["body"] as JObject;
+            if (body != null)
+              detail = $"(thread {body["threadId"]}, {body["reason"]})";
+          }
+          else if (type == "output")
+          {
+            var body = evt["body"] as JObject;
+            if (body != null)
+              detail = $"({body["category"]})";
+          }
+          sb.AppendLine($"{i + 1}. {type} {detail}".TrimEnd());
+        }
+      }
+      return sb.ToString().TrimEnd();
+    }
+
+    static string FormatBreakpointSync(JObject obj)
+    {
+      var sb = new StringBuilder();
+      var attached = obj["attached"] != null && (bool?)obj["attached"] == false;
+      var synced = obj["synced"] != null && (bool?)obj["synced"] == false;
+      sb.AppendLine(attached || synced ? "### Breakpoints Queued" : "### Breakpoints Set");
+      var sourcePath = (string)obj["sourcePath"];
+      if (!string.IsNullOrEmpty(sourcePath))
+        sb.AppendLine(ShortPath(sourcePath));
+
+      var lines = obj["lines"] as JArray;
+      if (lines != null && lines.Count > 0)
+        sb.AppendLine(BoldKV("Lines", string.Join(", ", lines)));
+
+      if (attached || synced)
+      {
+        sb.AppendLine("Will sync on attach");
+      }
+      else
+      {
+        var respBps = obj["response"]?["breakpoints"] as JArray;
+        if (respBps != null && respBps.Count > 0)
+        {
+          sb.AppendLine();
+          sb.AppendLine("| Line | Verified |");
+          sb.AppendLine("|------|----------|");
+          foreach (var bp in respBps)
+            sb.AppendLine($"| {bp["line"]} | {BoolYesNo(bp["verified"])} |");
+        }
+      }
+      return sb.ToString().TrimEnd();
+    }
+
+    static string FormatBreakpointList(JObject obj)
+    {
+      var sb = new StringBuilder();
+      sb.AppendLine("### Breakpoints");
+      var sourcePath = (string)obj["sourcePath"];
+      if (!string.IsNullOrEmpty(sourcePath))
+        sb.AppendLine(ShortPath(sourcePath));
+      var lines = obj["lines"] as JArray;
+      sb.AppendLine(BoldKV("Lines", lines != null && lines.Count > 0 ? string.Join(", ", lines) : "(none)"));
+      return sb.ToString().TrimEnd();
+    }
+
+    static string FormatBreakpointListAll(JObject obj)
+    {
+      var breakpoints = obj["breakpoints"] as JArray;
+      if (breakpoints == null || breakpoints.Count == 0)
+        return "### Breakpoints\n(none)";
+      var sb = new StringBuilder();
+      sb.AppendLine("### All Breakpoints");
+      sb.Append(FormatBreakpointsCompact(breakpoints));
+      return sb.ToString().TrimEnd();
+    }
+
+    static string FormatClearAll(JObject obj)
+    {
+      var sb = new StringBuilder();
+      sb.AppendLine("### All Breakpoints Cleared");
+      var breakpoints = obj["breakpoints"] as JArray;
+      if (breakpoints != null && breakpoints.Count > 0)
+        sb.Append(FormatBreakpointsCompact(breakpoints));
+      else
+        sb.AppendLine("(none)");
+      return sb.ToString().TrimEnd();
+    }
+
+    static string FormatEnterPlay(JObject obj)
+    {
+      var sb = new StringBuilder();
+      sb.AppendLine("### Enter Play Mode");
+      var resp = obj["response"] as JObject;
+      if (resp != null)
+      {
+        var playing = (bool?)resp["isPlaying"] == true ? "yes" : "no";
+        var changing = (bool?)resp["isPlayingOrWillChangePlaymode"] == true ? " (changing)" : "";
+        var controlPort = resp["controlPort"];
+        sb.AppendLine($"{BoldKV("Playing", $"{playing}{changing}")} | {BoldKV("Control Port", controlPort)}");
+      }
+      else
+      {
+        sb.AppendLine(BoldKV("Requested", "yes"));
+      }
+      return sb.ToString().TrimEnd();
+    }
+
+    static string FormatWait(JObject obj)
+    {
+      var stopped = obj["stopped"] as JObject;
+      var threadId = obj["threadId"] ?? stopped?["threadId"];
+      var reason = stopped?["reason"];
+      var topFrame = obj["topFrame"] as JObject;
+      var sb = new StringBuilder();
+      sb.AppendLine($"### Stopped — Thread {threadId}");
+
+      if (topFrame != null)
+      {
+        var sourceName = (string)(topFrame["source"]?["name"] ?? "");
+        var line = topFrame["line"] ?? "";
+        sb.AppendLine($"{BoldKV("File", $"{sourceName}:{line}")} | {BoldKV("Reason", reason)}");
+      }
+      else
+      {
+        sb.AppendLine(FormatStoppedOneLine(stopped));
+      }
+
+      var frames = obj["stackFrames"] as JArray;
+      if (frames != null && frames.Count > 0)
+      {
+        sb.AppendLine();
+        sb.Append(FormatStackFrames(frames));
+      }
+
+      var variables = obj["variables"] as JArray;
+      if (variables != null && variables.Count > 0)
+      {
+        sb.AppendLine();
+        sb.Append(FormatVariables(variables));
+      }
+
+      var evaluations = obj["evaluations"] as JObject;
+      if (evaluations != null && evaluations.Count > 0)
+      {
+        sb.AppendLine();
+        sb.Append(FormatEvaluations(evaluations));
+      }
+
+      return sb.ToString().TrimEnd();
+    }
+
+    static string FormatSnapshot(JObject obj)
+    {
+      var sb = new StringBuilder();
+      var threadId = obj["threadId"];
+      sb.AppendLine($"### Snapshot — Thread {threadId}");
+      sb.AppendLine();
+
+      var frames = obj["stackFrames"] as JArray;
+      sb.Append(FormatStackFrames(frames));
+      if (frames != null && frames.Count > 0)
+        sb.AppendLine();
+
+      var variables = obj["variables"] as JArray;
+      if (variables != null && variables.Count > 0)
+      {
+        sb.Append(FormatVariables(variables));
+        sb.AppendLine();
+      }
+
+      var evaluations = obj["evaluations"] as JObject;
+      if (evaluations != null && evaluations.Count > 0)
+      {
+        sb.Append(FormatEvaluations(evaluations));
+      }
+      return sb.ToString().TrimEnd();
+    }
+
+    static string FormatStepWithStop(JObject obj)
+    {
+      var sb = new StringBuilder();
+      var command = (string)obj["command"] ?? "step";
+      var stopped = obj["stopped"] as JObject;
+      var threadId = stopped?["threadId"] ?? obj["threadId"];
+      var reason = stopped?["reason"] ?? obj["stopped"]?["body"]?["reason"];
+
+      sb.AppendLine($"### Step ({command}) — Thread {threadId}");
+      sb.AppendLine(BoldKV("Reason", reason));
+
+      var snapshot = obj["snapshot"] as JObject;
+      if (snapshot != null)
+      {
+        var frames = snapshot["stackFrames"] as JArray;
+        if (frames != null && frames.Count > 0)
+        {
+          sb.AppendLine();
+          sb.Append(FormatStackFrames(frames));
+        }
+        var variables = snapshot["variables"] as JArray;
+        if (variables != null && variables.Count > 0)
+        {
+          sb.AppendLine();
+          sb.Append(FormatVariables(variables));
+        }
+      }
+      return sb.ToString().TrimEnd();
+    }
+
+    static string FormatStepSimple(JObject obj)
+    {
+      var sb = new StringBuilder();
+      var command = (string)obj["command"] ?? "step";
+      var allContinued = obj["response"]?["allThreadsContinued"];
+      if (command == "continue")
+      {
+        sb.AppendLine("### Continue");
+        sb.AppendLine(BoldKV("All threads continued", BoolYesNo(allContinued)));
+      }
+      else if (command == "pause")
+      {
+        sb.AppendLine($"### Pause");
+        sb.AppendLine("Command sent.");
+      }
+      else
+      {
+        sb.AppendLine($"### Step ({command})");
+        sb.AppendLine(BoldKV("All threads continued", BoolYesNo(allContinued)));
+      }
+      return sb.ToString().TrimEnd();
+    }
+
+    static string FormatRunTests(JObject obj)
+    {
+      var sb = new StringBuilder();
+      sb.AppendLine("### Run Tests");
+      sb.AppendLine($"{BoldKV("Mode", obj["testMode"])} | {BoldKV("Filter", obj["testFilter"] ?? "(none)")}");
+      sb.AppendLine(BoldKV("Requested", "yes"));
+      var note = (string)obj["note"];
+      if (!string.IsNullOrEmpty(note))
+        sb.AppendLine($"> {note}");
+      return sb.ToString().TrimEnd();
+    }
+
+    static string FormatEnterPlayAndStop(JObject obj)
+    {
+      var sb = new StringBuilder();
+      sb.AppendLine("### Enter Play Mode");
+      var enterResp = obj["enterPlayMode"] as JObject;
+      var resp = enterResp?["response"] as JObject;
+      if (resp != null)
+      {
+        var playing = (bool?)resp["isPlaying"] == true ? "yes" : "no";
+        var changing = (bool?)resp["isPlayingOrWillChangePlaymode"] == true ? " (changing)" : "";
+        sb.AppendLine(BoldKV("Playing", $"{playing}{changing}"));
+      }
+      else
+      {
+        sb.AppendLine(BoldKV("Requested", "yes"));
+      }
+
+      var stopped = obj["stopped"] as JObject;
+      if (stopped != null)
+      {
+        sb.AppendLine();
+        sb.AppendLine("### Stopped");
+        sb.AppendLine(FormatStoppedOneLine(stopped));
+      }
+
+      var snapshot = obj["snapshot"] as JObject;
+      if (snapshot != null)
+      {
+        var frames = snapshot["stackFrames"] as JArray;
+        if (frames != null && frames.Count > 0)
+        {
+          sb.AppendLine();
+          sb.Append(FormatStackFrames(frames));
+        }
+        var variables = snapshot["variables"] as JArray;
+        if (variables != null && variables.Count > 0)
+        {
+          sb.AppendLine();
+          sb.Append(FormatVariables(variables));
+        }
+      }
+      return sb.ToString().TrimEnd();
+    }
+
+    static string FormatResumeUntilStopped(JObject obj)
+    {
+      var sb = new StringBuilder();
+      sb.AppendLine("### Continued");
+      var continued = obj["continued"] as JObject;
+      var allContinued = continued?["response"]?["allThreadsContinued"];
+      sb.AppendLine(BoldKV("All threads continued", BoolYesNo(allContinued)));
+
+      var stopped = obj["stopped"] as JObject;
+      if (stopped != null)
+      {
+        sb.AppendLine();
+        sb.AppendLine("### Stopped");
+        sb.AppendLine(FormatStoppedOneLine(stopped));
+      }
+
+      var snapshot = obj["snapshot"] as JObject;
+      if (snapshot != null)
+      {
+        var frames = snapshot["stackFrames"] as JArray;
+        if (frames != null && frames.Count > 0)
+        {
+          sb.AppendLine();
+          sb.Append(FormatStackFrames(frames));
+        }
+        var variables = snapshot["variables"] as JArray;
+        if (variables != null && variables.Count > 0)
+        {
+          sb.AppendLine();
+          sb.Append(FormatVariables(variables));
+        }
+      }
+      return sb.ToString().TrimEnd();
+    }
+
+    static string FormatDiagnose(JObject obj)
+    {
+      var sb = new StringBuilder();
+      sb.AppendLine($"### Diagnose — Session `{obj["sessionId"]}`");
+      var status = obj["status"] as JObject;
+      if (status != null)
+        sb.AppendLine(FormatStatusOneLine(status));
+
+      var adapterTail = obj["adapterLogTail"] as JArray;
+      sb.AppendLine();
+      sb.Append(FormatLogTail("Adapter Log", adapterTail, adapterTail?.Count));
+
+      var unityTail = obj["unityLogTail"] as JArray;
+      sb.AppendLine();
+      sb.Append(FormatLogTail("Unity Log", unityTail, unityTail?.Count));
+
+      var transcriptTail = obj["transcriptTail"] as JArray;
+      sb.AppendLine();
+      sb.Append(FormatLogTail("Transcript", transcriptTail, transcriptTail?.Count));
+
+      return sb.ToString().TrimEnd();
+    }
+
+    // ── Tool definitions ──────────────────────────────────────────────
 
     static JObject Tool(string name, string description, JObject inputSchema)
     {
@@ -755,6 +1431,7 @@ namespace UnityDebugAdapter
     bool m_Attached;
     bool m_OwnsUnityProcess;
     bool m_SetExceptionBreakpoints;
+    int m_AdapterStartCount;
 
     public string SessionId { get; }
     public int UnityPid { get; private set; }
@@ -791,6 +1468,7 @@ namespace UnityDebugAdapter
     public object Attach(JObject args, bool startUnityIfNoPid)
     {
       ApplyOptions(args);
+      Logger.LogInfo("MCP Attach V2-RESETDEBUGGER codeVersion=2026-06-10b session={0}", SessionId);
 
       if (!File.Exists(m_AdapterPath))
         throw new FileNotFoundException("adapter executable not found", m_AdapterPath);
@@ -819,9 +1497,24 @@ namespace UnityDebugAdapter
       }
 
       SyncRequestedBreakpoints(args);
+      var injected = EnsureEditorScripts(m_ProjectPath);
       ResolveUnityProcess(requestedUnityPid, startUnityIfNoPid);
 
+      // Always wait for the control port to be ready, not just after injection.
+      // The control server may not be up yet if Unity is still initializing,
+      // or if the script was injected in a previous session and Unity has
+      // restarted since then.  Without this wait, ResetUnityDebugger would
+      // send a command that nobody processes.
+      if (IsUnityProcessAlive())
+        WaitControlPortReady(UnityPid, m_StartupTimeoutSeconds);
+
       Port = 56000 + UnityPid % 1000;
+
+      // Reset Unity's debugger endpoint to clear any stale session left by a
+      // previous adapter crash.  Without this, the Mono soft debugger will accept
+      // TCP connections but never send VMStart, making attach hang forever.
+      ResetUnityDebugger();
+
       var deadline = DateTime.UtcNow.AddSeconds(m_StartupTimeoutSeconds);
       Exception last = null;
       var attempt = 0;
@@ -845,6 +1538,14 @@ namespace UnityDebugAdapter
           Logger.LogInfo("MCP attach attempt {0} starting for session={1}", attempt, SessionId);
           if (m_Client == null || !m_Client.IsRunning)
             StartAdapterClient();
+
+          // Use a short timeout for the first attempt to quickly detect and
+          // flush stale debugger sessions.  If a previous adapter crashed without
+          // sending DAP disconnect, Unity keeps the old session alive and will
+          // not send VMStart on the first connection.  The failed connection
+          // triggers Unity to start cleanup; subsequent attempts succeed.
+          var readyTimeout = attempt <= 2 ? 5.0 : Math.Max(20.0, m_ReadyTimeoutSeconds);
+          var requestTimeout = readyTimeout + 5.0;
           EnsureSuccess(m_Client.Request("attach", new JObject
           {
             ["address"] = "127.0.0.1",
@@ -852,8 +1553,8 @@ namespace UnityDebugAdapter
             ["name"] = $"Connect to Unity Editor instance at 127.0.0.1:{Port}",
             ["type"] = "unity",
             ["port"] = Port,
-            ["attachReadyTimeoutSeconds"] = Math.Max(20.0, m_ReadyTimeoutSeconds)
-          }, Math.Max(25.0, m_ReadyTimeoutSeconds + 25.0)));
+            ["attachReadyTimeoutSeconds"] = readyTimeout
+          }, requestTimeout));
           m_Attached = true;
           var breakpointSync = SyncAllBreakpoints();
           object exceptionBreakpoints = null;
@@ -876,8 +1577,7 @@ namespace UnityDebugAdapter
           last = e;
           Logger.LogWarn("MCP attach attempt {0} failed for session={1}: {2}", attempt, SessionId, e.Message);
           SaveTranscript();
-          if (m_Client == null || !m_Client.IsRunning)
-            StopAdapterClient();
+          StopAdapterClient();
           System.Threading.Thread.Sleep(2000);
         }
       }
@@ -891,7 +1591,15 @@ namespace UnityDebugAdapter
     void StartAdapterClient()
     {
       StopAdapterClient();
-      m_Client = new DapProcessClient(m_AdapterPath, AdapterLogPath, m_RequestTimeoutSeconds);
+      var logDir = Path.GetDirectoryName(AdapterLogPath);
+      var logBase = Path.GetFileNameWithoutExtension(AdapterLogPath);
+      var logExt = Path.GetExtension(AdapterLogPath);
+      // Use attempt counter to avoid overwriting logs from previous attempts.
+      var attemptLogPath = m_AdapterStartCount == 0
+          ? AdapterLogPath
+          : Path.Combine(logDir, $"{logBase}-{m_AdapterStartCount}{logExt}");
+      m_AdapterStartCount++;
+      m_Client = new DapProcessClient(m_AdapterPath, attemptLogPath, m_RequestTimeoutSeconds);
       m_Client.Start();
       EnsureSuccess(m_Client.Request("initialize", new JObject
       {
@@ -902,6 +1610,35 @@ namespace UnityDebugAdapter
         ["clientName"] = "mcp",
         ["clientID"] = "mcp"
       }));
+    }
+
+    void ResetUnityDebugger()
+    {
+      if (!IsUnityProcessAlive())
+        return;
+
+      try
+      {
+        // First verify Unity's Update() loop is processing commands by sending
+        // a status ping.  After domain reload the TCP listener starts immediately
+        // but the main-thread Update() callback may not have fired yet.
+        Logger.LogInfo("MCP pinging Unity control port before resetdebugger");
+        var ping = SendUnityControlCommand(new JObject { ["command"] = "status" }, new JObject());
+        Logger.LogInfo("MCP status ping response: {0}", ping.ToString(Formatting.None));
+
+        Logger.LogInfo("MCP sending resetdebugger to Unity control port");
+        var response = SendUnityControlCommand(new JObject { ["command"] = "resetdebugger" }, new JObject());
+        Logger.LogInfo("MCP resetdebugger response: {0}", response.ToString(Formatting.None));
+
+        // Give Unity a moment to process the reset before we try to attach.
+        System.Threading.Thread.Sleep(1000);
+      }
+      catch (Exception e)
+      {
+        // Non-fatal: the control server might not be injected yet, or this is a
+        // fresh Unity session that doesn't need reset.
+        Logger.LogInfo("MCP resetdebugger skipped: {0}", e.Message);
+      }
     }
 
     void StopAdapterClient()
@@ -1327,12 +2064,40 @@ namespace UnityDebugAdapter
       EnsureAttached();
       var timeout = (double?)args["timeoutSeconds"] ?? 60.0;
       m_LastStoppedEvent = m_Client.WaitEvent("stopped", timeout);
-      SaveTranscript();
-      return new
+      var stoppedBody = m_LastStoppedEvent["body"];
+
+      // Auto-snapshot: fetch stack, variables, and (optionally) evaluations
+      var snapArgs = new JObject { ["sessionId"] = SessionId };
+      if (args["expressions"] != null)
+        snapArgs["expressions"] = args["expressions"];
+      else
+        snapArgs["expressions"] = new JArray(); // No evaluations unless caller asks
+
+      var snapObj = Snapshot(snapArgs);
+      var combined = JObject.FromObject(snapObj);
+      combined["stopped"] = stoppedBody;
+      return combined;
+    }
+
+    /// <summary>
+    /// Extracts (stoppedBody, snapshotSubObject) from the combined JObject
+    /// returned by WaitStopped, so callers like EnterPlayAndStop can pass
+    /// the two pieces separately without calling Snapshot again.
+    /// </summary>
+    static (JToken, JObject) ExtractWaitResult(object waitResult)
+    {
+      var wr = waitResult as JObject ?? JObject.FromObject(waitResult);
+      var stoppedBody = wr["stopped"];
+      var snapshot = new JObject
       {
-        sessionId = SessionId,
-        stopped = m_LastStoppedEvent["body"]
+        ["sessionId"] = wr["sessionId"],
+        ["threadId"] = wr["threadId"],
+        ["topFrame"] = wr["topFrame"],
+        ["stackFrames"] = wr["stackFrames"],
+        ["variables"] = wr["variables"],
+        ["evaluations"] = wr["evaluations"]
       };
+      return (stoppedBody, snapshot);
     }
 
     public object Snapshot(JObject args)
@@ -1420,6 +2185,7 @@ namespace UnityDebugAdapter
       return new
       {
         sessionId = SessionId,
+        command = "continue",
         response = response["body"]
       };
     }
@@ -1473,15 +2239,14 @@ namespace UnityDebugAdapter
         };
       }
 
-      var stopped = WaitStopped(args);
-      var snapshot = Snapshot(args);
+      var wr = ExtractWaitResult(WaitStopped(args));
       return new
       {
         sessionId = SessionId,
         command,
         response = response["body"],
-        stopped,
-        snapshot,
+        stopped = wr.Item1,
+        snapshot = wr.Item2,
         status = Status()
       };
     }
@@ -1546,14 +2311,13 @@ namespace UnityDebugAdapter
     public object EnterPlayAndStop(JObject args)
     {
       var enterPlayMode = EnterPlayMode(args);
-      var stopped = WaitStopped(args);
-      var snapshot = Snapshot(args);
+      var wr = ExtractWaitResult(WaitStopped(args));
       return new
       {
         sessionId = SessionId,
         enterPlayMode,
-        stopped,
-        snapshot,
+        stopped = wr.Item1,
+        snapshot = wr.Item2,
         status = Status()
       };
     }
@@ -1561,14 +2325,13 @@ namespace UnityDebugAdapter
     public object ResumeUntilStopped(JObject args)
     {
       var continued = Continue(args);
-      var stopped = WaitStopped(args);
-      var snapshot = Snapshot(args);
+      var wr = ExtractWaitResult(WaitStopped(args));
       return new
       {
         sessionId = SessionId,
         continued,
-        stopped,
-        snapshot,
+        stopped = wr.Item1,
+        snapshot = wr.Item2,
         status = Status()
       };
     }
@@ -1724,6 +2487,99 @@ namespace UnityDebugAdapter
       if (Path.IsPathRooted(path))
         return Path.GetFullPath(path);
       return Path.GetFullPath(Path.Combine(m_Root, path));
+    }
+
+    bool EnsureEditorScripts(string projectPath)
+    {
+      try
+      {
+        var assembly = Assembly.GetExecutingAssembly();
+        var resourceName = "McpPlayModeController.cs";
+        string template;
+        using (var stream = assembly.GetManifestResourceStream(resourceName))
+        {
+          if (stream == null)
+          {
+            Logger.LogInfo("MCP Editor template resource '{0}' not found in assembly, skipping injection", resourceName);
+            return false;
+          }
+          using (var reader = new StreamReader(stream, Encoding.UTF8))
+            template = reader.ReadToEnd();
+        }
+
+        var editorDir = Path.Combine(projectPath, "Assets", "Editor");
+        var targetPath = Path.Combine(editorDir, "McpPlayModeController.cs");
+
+        if (File.Exists(targetPath))
+        {
+          var existing = File.ReadAllText(targetPath, Encoding.UTF8);
+          if (string.Equals(existing, template, StringComparison.Ordinal))
+          {
+            Logger.LogInfo("MCP Editor script already up to date: {0}", targetPath);
+            return false;
+          }
+
+          File.WriteAllText(targetPath, template, Encoding.UTF8);
+          Logger.LogInfo("MCP Editor script updated: {0}", targetPath);
+          return true;
+        }
+
+        Directory.CreateDirectory(editorDir);
+        File.WriteAllText(targetPath, template, Encoding.UTF8);
+        Logger.LogInfo("MCP Editor script injected: {0}", targetPath);
+        return true;
+      }
+      catch (Exception e)
+      {
+        Logger.LogInfo("MCP Editor script injection failed (non-fatal): {0}", e.Message);
+        return false;
+      }
+    }
+
+    void WaitControlPortReady(int pid, double timeoutSeconds)
+    {
+      var controlPort = 57000 + Math.Abs(pid % 1000);
+      var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
+      Logger.LogInfo("MCP waiting for Editor controller on port {0} (timeout {1}s)", controlPort, timeoutSeconds);
+
+      while (DateTime.UtcNow < deadline)
+      {
+        try
+        {
+          using (var client = new TcpClient())
+          {
+            client.Connect("127.0.0.1", controlPort);
+            client.ReceiveTimeout = 3000;
+            client.SendTimeout = 3000;
+
+            var request = Encoding.UTF8.GetBytes("{\"command\":\"status\"}\n");
+            var stream = client.GetStream();
+            stream.Write(request, 0, request.Length);
+            stream.Flush();
+
+            using (var reader = new StreamReader(stream, Encoding.UTF8))
+            {
+              var line = reader.ReadLine();
+              if (!string.IsNullOrWhiteSpace(line))
+              {
+                var response = JObject.Parse(line);
+                if ((bool?)response["ok"] == true)
+                {
+                  Logger.LogInfo("MCP Editor controller active on port {0}", controlPort);
+                  return;
+                }
+              }
+            }
+          }
+        }
+        catch { }
+
+        System.Threading.Thread.Sleep(500);
+      }
+
+      throw new TimeoutException(
+          "Timed out waiting for MCP Editor controller on port " + controlPort +
+          ". Unity may have compilation errors — check the Unity Console.");
     }
 
     bool IsUnityProcessAlive()
