@@ -1,4 +1,4 @@
-# Unity Debug Adapter
+# Unity Agent Debugger
 
 A production-grade Mono-based Unity debugger with **first-class agent support** via the Model Context Protocol (MCP). The only debug adapter purpose-built for AI coding agents debugging Unity in real time.
 
