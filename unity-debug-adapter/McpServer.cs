@@ -21,6 +21,12 @@ namespace UnityDebugAdapter
 
     public void Start()
     {
+      // MCP JSON-RPC requires UTF-8; Windows console defaults to a legacy
+      // code page which corrupts non-ASCII characters like — (em-dash).
+      var utf8NoBom = new System.Text.UTF8Encoding(false);
+      Console.OutputEncoding = utf8NoBom;
+      Console.InputEncoding = utf8NoBom;
+
       string line;
       while ((line = Console.In.ReadLine()) != null)
       {
@@ -133,7 +139,7 @@ namespace UnityDebugAdapter
                 Prop("lines", "array", "Breakpoint lines."),
                 BreakpointsProp("breakpoints", "Breakpoint specs: { line, column, condition, hitCondition, logMessage }."),
                 Prop("oldLine", "integer", "Existing breakpoint line for update."),
-                Prop("newLine", "integer", "New breakpoint line for update."),
+                Prop("newLine", "integer", "Optional. New breakpoint line. Defaults to oldLine."),
                 Prop("condition", "string", "Condition expression for update."),
                 Prop("hitCondition", "string", "Hit condition for update."),
                 Prop("logMessage", "string", "Logpoint message/expression for update.")
@@ -151,9 +157,9 @@ namespace UnityDebugAdapter
                 Prop("testMode", "string", "Unity Test Runner mode: EditMode, PlayMode, or All. Default EditMode."),
                 Prop("testFilter", "string", "Optional Unity test name filter.")
               )),
-          Tool("unity_debug_status", "Return status, breakpoints, or diagnostics for the active Unity debug session.",
+          Tool("unity_debug_status", "Read-only diagnostic companion to unity_debug_session. Query connection status, breakpoint summary, or detailed adapter logs and DAP transcript.",
               Obj(
-                Prop("action", "string", "status, breakpoints, diagnose. Default status."),
+                Prop("action", "string", "status (same as unity_debug_session status), breakpoints, diagnose. Default status."),
                 Prop("sessionId", "string", "Session id. Defaults to the active session."),
                 Prop("sourcePath", "string", "Optional source path filter for breakpoints."),
                 Prop("tailLines", "integer", "Number of log lines for diagnose. Default 30.")
@@ -247,7 +253,7 @@ namespace UnityDebugAdapter
           result = WithSession(args, s => s.RunTests(args));
           break;
         case "unity_debug_disconnect":
-          result = WithSession(args, s => s.Detach());
+          result = WithSession(args, s => s.Detach("disconnect"));
           break;
         case "unity_debug_status":
           result = ToolStatus(args);
@@ -276,9 +282,12 @@ namespace UnityDebugAdapter
         case "prepare":
           return ToolPrepare(args);
         case "detach":
+          return WithSession(args, s => s.Detach("detach"));
         case "disconnect":
-          return WithSession(args, s => s.Detach());
+          return WithSession(args, s => s.Detach("disconnect"));
         case "reset":
+          try { WithSession(args, s => s.Detach("reset")); } catch { }
+          return ToolCleanup(args);
         case "cleanup":
           return ToolCleanup(args);
         default:
@@ -582,21 +591,26 @@ namespace UnityDebugAdapter
       var obj = token as JObject;
       if (obj == null) return token.ToString(Formatting.Indented);
 
-      // Dispatch by detected shape (most specific first)
+      // Dispatch by detected shape (most specific first).
+      // recentEvents must be checked BEFORE attached+unityPid so that
+      // Status() results (which have both) route to FormatStatus instead
+      // of FormatAttach.  FormatAttach is reserved for Attach() results
+      // which carry a nested "status" sub-object.
       if (obj["cleaned"] != null) return FormatCleanup(obj);
       if (obj["detached"] != null) return FormatDetach(obj);
       if (obj["active"] != null && obj["message"] != null) return FormatNoSession(obj);
       if (obj["adapterLogTail"] != null) return FormatDiagnose(obj);
       if (obj["active"] != null && obj["start"] != null) return FormatPrepare(obj);
+      if (obj["recentEvents"] != null) return FormatStatus(obj);
       if (obj["attached"] != null && obj["unityPid"] != null) return FormatAttach(obj);
       if (obj["requested"] != null && obj["testMode"] != null) return FormatRunTests(obj);
       if (obj["enterPlayMode"] != null) return FormatEnterPlayAndStop(obj);
       if (obj["continued"] != null && obj["stopped"] != null && obj["snapshot"] != null) return FormatResumeUntilStopped(obj);
       if (obj["requested"] != null && obj["response"] != null) return FormatEnterPlay(obj);
-      if (obj["recentEvents"] != null) return FormatStatus(obj);
       if (obj["threadId"] != null && obj["topFrame"] != null && obj["stackFrames"] != null && obj["stopped"] == null) return FormatSnapshot(obj);
       if (obj["stopped"] != null && obj["command"] == null && obj["snapshot"] == null) return FormatWait(obj);
       if (obj["command"] != null && obj["stopped"] != null && obj["snapshot"] != null) return FormatStepWithStop(obj);
+      if (obj["warning"] != null && obj["command"] != null) return FormatStepWarning(obj);
       if (obj["command"] != null) return FormatStepSimple(obj);
       if (obj["sourcePath"] != null && obj["responses"] != null) return FormatClearAll(obj);
       if (obj["sourcePath"] != null && obj["response"] != null) return FormatBreakpointSync(obj);
@@ -852,7 +866,8 @@ namespace UnityDebugAdapter
     static string FormatDetach(JObject obj)
     {
       var sb = new StringBuilder();
-      sb.AppendLine("### Detached");
+      var action = (string)obj["action"] ?? "detach";
+      sb.AppendLine(action == "disconnect" ? "### Disconnected" : "### Detached");
       sb.AppendLine(BoldKV("Session", $"`{obj["sessionId"]}`"));
       var detached = obj["detached"];
       if (detached != null)
@@ -897,7 +912,8 @@ namespace UnityDebugAdapter
     static string FormatStatus(JObject obj)
     {
       var sb = new StringBuilder();
-      sb.AppendLine("### Session Status");
+      var isAttached = (bool?)obj["attached"] == true;
+      sb.AppendLine(isAttached ? "### Attached" : "### Detached");
       sb.AppendLine(BoldKV("Session", $"`{obj["sessionId"]}`"));
       sb.AppendLine($"{BoldKV("Unity PID", obj["unityPid"])} | {BoldKV("Port", obj["port"])}");
       sb.AppendLine(FormatStatusOneLine(obj));
@@ -916,19 +932,6 @@ namespace UnityDebugAdapter
         sb.AppendLine();
         sb.AppendLine("### Breakpoints");
         sb.Append(FormatBreakpointsCompact(breakpoints));
-      }
-
-      var logPaths = new[] { "adapterLogPath", "unityLogPath", "transcriptPath" };
-      var logLabels = new[] { "Adapter", "Unity", "Transcript" };
-      var hasAny = false;
-      for (int i = 0; i < logPaths.Length; i++)
-      {
-        var p = (string)obj[logPaths[i]];
-        if (!string.IsNullOrEmpty(p))
-        {
-          if (!hasAny) { sb.AppendLine(); hasAny = true; }
-          sb.AppendLine($"{BoldKV(logLabels[i], $"`{p}`")}");
-        }
       }
 
       var recentEvents = obj["recentEvents"] as JArray;
@@ -988,6 +991,8 @@ namespace UnityDebugAdapter
         if (respBps != null && respBps.Count > 0)
         {
           sb.AppendLine();
+          // Collect unverified breakpoints for a warning section
+          var unverifiedNotes = new List<string>();
           if (hasDetails)
           {
             sb.AppendLine("| Line | Verified | Condition | Hit | Log |");
@@ -995,11 +1000,17 @@ namespace UnityDebugAdapter
             foreach (var bp in respBps)
             {
               var line = (int?)bp["line"] ?? 0;
+              var verified = (bool?)bp["verified"] == true;
               var spec = trackedSpecs?.FirstOrDefault(s => (int?)s["line"] == line);
               var cond = (string)spec?["condition"] ?? "";
               var hit = (string)spec?["hitCondition"] ?? "";
               var log = (string)spec?["logMessage"] ?? "";
               sb.AppendLine($"| {line} | {BoolYesNo(bp["verified"])} | {EscapeMd(cond)} | {EscapeMd(hit)} | {EscapeMd(log)} |");
+              if (!verified)
+              {
+                var msg = (string)bp["message"] ?? "Breakpoint not verified — the source location may not exist or may not be executable code.";
+                unverifiedNotes.Add($"- Line {line}: {msg}");
+              }
             }
           }
           else
@@ -1007,7 +1018,21 @@ namespace UnityDebugAdapter
             sb.AppendLine("| Line | Verified |");
             sb.AppendLine("|------|----------|");
             foreach (var bp in respBps)
+            {
               sb.AppendLine($"| {bp["line"]} | {BoolYesNo(bp["verified"])} |");
+              if ((bool?)bp["verified"] != true)
+              {
+                var msg = (string)bp["message"] ?? "Breakpoint not verified — the source location may not exist or may not be executable code.";
+                unverifiedNotes.Add($"- Line {bp["line"]}: {msg}");
+              }
+            }
+          }
+          if (unverifiedNotes.Count > 0)
+          {
+            sb.AppendLine();
+            sb.AppendLine("### Warnings");
+            foreach (var note in unverifiedNotes)
+              sb.AppendLine(note);
           }
         }
       }
@@ -1120,6 +1145,14 @@ namespace UnityDebugAdapter
       sb.AppendLine();
 
       var frames = obj["stackFrames"] as JArray;
+      if (frames != null && frames.Count > 0)
+      {
+        var topFrame = frames[0] as JObject;
+        var hint = (string)topFrame?["presentationHint"];
+        if (hint != null && hint != "normal")
+          sb.AppendLine($"> **Non-user frame** (`{hint}`): expression evaluation may return `invalid expression`. Set a breakpoint in user code to inspect variables.");
+        sb.AppendLine();
+      }
       sb.Append(FormatStackFrames(frames));
       if (frames != null && frames.Count > 0)
         sb.AppendLine();
@@ -1135,6 +1168,31 @@ namespace UnityDebugAdapter
       if (evaluations != null && evaluations.Count > 0)
       {
         sb.Append(FormatEvaluations(evaluations));
+      }
+      return sb.ToString().TrimEnd();
+    }
+
+    static string FormatStepWarning(JObject obj)
+    {
+      var sb = new StringBuilder();
+      var command = (string)obj["command"] ?? "step";
+      var frameName = (string)obj["frameName"] ?? "?";
+      var sourceLine = (string)obj["sourceLine"] ?? "";
+      var hint = (string)obj["frameHint"] ?? "subtle";
+      var suggestion = (string)obj["suggestion"] ?? "";
+
+      sb.AppendLine($"### Step Warning — {command}");
+      if (hint == "error")
+      {
+        sb.AppendLine(BoldKV("Frame", $"`{frameName}`"));
+        sb.AppendLine("> Target is no longer available. Detach and re-prepare to continue debugging.");
+      }
+      else
+      {
+        sb.AppendLine(BoldKV("Frame", $"`{frameName}` — {sourceLine}"));
+        sb.AppendLine(BoldKV("Hint", hint));
+        if (!string.IsNullOrEmpty(suggestion))
+          sb.AppendLine($"> {suggestion}");
       }
       return sb.ToString().TrimEnd();
     }
@@ -1824,11 +1882,9 @@ namespace UnityDebugAdapter
     {
       var sourcePath = SourceFullPath((string)args["sourcePath"] ?? m_SourcePath);
       var oldLine = (int?)args["oldLine"];
-      var newLine = (int?)args["newLine"];
+      var newLine = (int?)args["newLine"] ?? oldLine;
       if (!oldLine.HasValue || oldLine.Value <= 0)
         throw new InvalidOperationException("oldLine must be a positive integer");
-      if (!newLine.HasValue || newLine.Value <= 0)
-        throw new InvalidOperationException("newLine must be a positive integer");
 
       var tracked = GetTrackedBreakpoints(sourcePath);
       if (!tracked.TryGetValue(oldLine.Value, out var breakpoint))
@@ -2279,7 +2335,50 @@ namespace UnityDebugAdapter
         throw new InvalidOperationException("threadId is required because no stopped event is cached");
 
       if (command != "pause")
+      {
         requestArgs["granularity"] = "statement";
+
+        // stepOut from the entry frame has no caller to return to; the
+        // debuggee will often terminate, leaving the adapter in a bad state.
+        if (command == "stepOut" && threadId.HasValue)
+        {
+          var totalFrames = GetTotalFrames(threadId.Value);
+          if (totalFrames.HasValue && totalFrames.Value <= 1)
+          {
+            var entryFrame = GetTopFrame(threadId);
+            var frameName = (string)entryFrame?["name"] ?? "?";
+            var sourceLine = FormatFrameSourceLine(entryFrame);
+            return new
+            {
+              sessionId = SessionId,
+              command,
+              warning = "stepOut from the entry frame — no caller to return to; the debuggee will likely terminate.",
+              frameName,
+              sourceLine,
+              suggestion = "Use `continue` to resume execution, or set a breakpoint and `wait` for a hit."
+            };
+          }
+        }
+
+        // Check if stopped on a non-user frame; stepping will likely fail/timeout
+        var topFrame = GetTopFrame(threadId);
+        var hint = (string)topFrame?["presentationHint"];
+        if (hint != null && hint != "normal")
+        {
+          var frameName = (string)topFrame?["name"] ?? "?";
+          var sourceLine = FormatFrameSourceLine(topFrame);
+          return new
+          {
+            sessionId = SessionId,
+            command,
+            warning = "Top frame is non-user code; stepping may not produce a stop event.",
+            frameName,
+            sourceLine,
+            frameHint = hint,
+            suggestion = "Use `continue` then `pause` to reach user code, or set a breakpoint in user code first."
+          };
+        }
+      }
 
       var response = m_Client.Request(command, requestArgs);
       EnsureSuccess(response);
@@ -2308,6 +2407,58 @@ namespace UnityDebugAdapter
         snapshot = wr.Item2,
         status = Status()
       };
+    }
+
+    JObject GetTopFrame(int? threadId)
+    {
+      if (!threadId.HasValue || m_Client == null)
+        return null;
+      try
+      {
+        var stack = m_Client.Request("stackTrace", new JObject
+        {
+          ["threadId"] = threadId.Value,
+          ["startFrame"] = 0,
+          ["levels"] = 1
+        });
+        if (stack != null && (stack["success"] == null || (bool)stack["success"]))
+        {
+          var frames = (stack["body"] as JObject)?["stackFrames"] as JArray;
+          return frames != null && frames.Count > 0 ? frames[0] as JObject : null;
+        }
+        // DAP request failed (e.g. target terminated) — return a sentinel to trigger warning
+        return new JObject { ["presentationHint"] = "error", ["name"] = "(target unavailable)" };
+      }
+      catch
+      {
+        return new JObject { ["presentationHint"] = "error", ["name"] = "(target unavailable)" };
+      }
+    }
+
+    int? GetTotalFrames(int threadId)
+    {
+      if (m_Client == null) return null;
+      try
+      {
+        var stack = m_Client.Request("stackTrace", new JObject
+        {
+          ["threadId"] = threadId,
+          ["startFrame"] = 0,
+          ["levels"] = 1
+        });
+        return (int?)stack?["body"]?["totalFrames"];
+      }
+      catch
+      {
+        return null;
+      }
+    }
+
+    static string FormatFrameSourceLine(JObject frame)
+    {
+      var sourceName = (string)(frame?["source"] as JObject)?["name"] ?? "";
+      var line = frame?["line"] ?? "";
+      return $"{sourceName}:{line}";
     }
 
     public object RunTests(JObject args)
@@ -2397,10 +2548,10 @@ namespace UnityDebugAdapter
 
     public object Disconnect()
     {
-      return Detach();
+      return Detach("disconnect");
     }
 
-    public object Detach()
+    public object Detach(string action = "detach")
     {
       object continued = null;
       JObject response = null;
@@ -2431,7 +2582,8 @@ namespace UnityDebugAdapter
         sessionId = SessionId,
         detached = response != null,
         continued,
-        response
+        response,
+        action
       };
     }
 
