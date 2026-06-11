@@ -251,6 +251,8 @@ namespace UnityDebugAdapter
         var tid = (int)e.Thread.Id;
         lock (m_SeenThreads)
         {
+          if (m_SeenThreads.ContainsKey(tid))
+            return;
           m_SeenThreads[tid] = new Thread(tid, e.Thread.Name);
         }
 

@@ -489,7 +489,8 @@ namespace UnityDebugAdapter
       }
       catch
       {
-        session.Detach();
+        try { session.Cleanup(); } catch { }
+        m_Sessions.Remove(session.SessionId);
         throw;
       }
     }
@@ -779,30 +780,7 @@ namespace UnityDebugAdapter
       sb.AppendLine(BoldKV("Session", $"`{obj["sessionId"]}`"));
       sb.AppendLine($"{BoldKV("Unity PID", obj["unityPid"])} | {BoldKV("Port", obj["port"])}");
 
-      var bpSync = obj["breakpointSync"] as JArray;
-      if (bpSync != null && bpSync.Count > 0)
-      {
-        var allBps = new JArray();
-        string firstSourcePath = null;
-        foreach (var sync in bpSync)
-        {
-          var resp = (sync["response"] as JObject)?["breakpoints"] as JArray;
-          if (resp != null) foreach (var bp in resp) allBps.Add(bp);
-          if (firstSourcePath == null)
-            firstSourcePath = (string)sync["sourcePath"];
-        }
-        if (allBps.Count > 0)
-        {
-          sb.AppendLine();
-          sb.AppendLine("### Breakpoints Synced");
-          if (!string.IsNullOrEmpty(firstSourcePath))
-            sb.AppendLine(ShortPath(firstSourcePath));
-          sb.AppendLine("| Line | Verified |");
-          sb.AppendLine("|------|----------|");
-          foreach (var bp in allBps)
-            sb.AppendLine($"| {bp["line"]} | {BoolYesNo(bp["verified"])} |");
-        }
-      }
+      AppendBreakpointSyncTable(sb, obj["breakpointSync"] as JArray);
 
       var status = obj["status"] as JObject;
       if (status != null)
@@ -824,30 +802,7 @@ namespace UnityDebugAdapter
         sb.AppendLine(BoldKV("Session", $"`{start["sessionId"]}`"));
         sb.AppendLine($"{BoldKV("Unity PID", start["unityPid"])} | {BoldKV("Port", start["port"])}");
 
-        var bpSync = start["breakpointSync"] as JArray;
-        if (bpSync != null && bpSync.Count > 0)
-        {
-          var allBps = new JArray();
-          string firstSourcePath = null;
-          foreach (var sync in bpSync)
-          {
-            var resp = (sync["response"] as JObject)?["breakpoints"] as JArray;
-            if (resp != null) foreach (var bp in resp) allBps.Add(bp);
-            if (firstSourcePath == null)
-              firstSourcePath = (string)sync["sourcePath"];
-          }
-          if (allBps.Count > 0)
-          {
-            sb.AppendLine();
-            sb.AppendLine("### Breakpoints Synced");
-            if (!string.IsNullOrEmpty(firstSourcePath))
-              sb.AppendLine(ShortPath(firstSourcePath));
-            sb.AppendLine("| Line | Verified |");
-            sb.AppendLine("|------|----------|");
-            foreach (var bp in allBps)
-              sb.AppendLine($"| {bp["line"]} | {BoolYesNo(bp["verified"])} |");
-          }
-        }
+        AppendBreakpointSyncTable(sb, start["breakpointSync"] as JArray);
       }
       else
       {
@@ -861,6 +816,33 @@ namespace UnityDebugAdapter
         sb.AppendLine(FormatStatusOneLine(status));
       }
       return sb.ToString().TrimEnd();
+    }
+
+    static void AppendBreakpointSyncTable(StringBuilder sb, JArray bpSync)
+    {
+      if (bpSync == null || bpSync.Count == 0)
+        return;
+
+      var allBps = new JArray();
+      string firstSourcePath = null;
+      foreach (var sync in bpSync)
+      {
+        var resp = (sync["response"] as JObject)?["breakpoints"] as JArray;
+        if (resp != null) foreach (var bp in resp) allBps.Add(bp);
+        if (firstSourcePath == null)
+          firstSourcePath = (string)sync["sourcePath"];
+      }
+      if (allBps.Count == 0)
+        return;
+
+      sb.AppendLine();
+      sb.AppendLine("### Breakpoints Synced");
+      if (!string.IsNullOrEmpty(firstSourcePath))
+        sb.AppendLine(ShortPath(firstSourcePath));
+      sb.AppendLine("| Line | Verified |");
+      sb.AppendLine("|------|----------|");
+      foreach (var bp in allBps)
+        sb.AppendLine($"| {bp["line"]} | {BoolYesNo(bp["verified"])} |");
     }
 
     static string FormatDetach(JObject obj)
@@ -1815,10 +1797,11 @@ namespace UnityDebugAdapter
         return;
       }
 
-      if (UnityPid > 0 && ProcessExists(UnityPid))
+      if (UnityPid > 0)
       {
         m_UnityProcess = TryGetProcessById(UnityPid);
-        return;
+        if (m_UnityProcess != null)
+          return;
       }
 
       var unityProcesses = FindUnityProcesses(m_ProjectPath);
@@ -1962,6 +1945,21 @@ namespace UnityDebugAdapter
         };
       }
 
+      // Check for terminated event before issuing DAP request
+      if (!CheckAndReconnectIfTerminated())
+      {
+        return new
+        {
+          sessionId = SessionId,
+          sourcePath,
+          attached = false,
+          synced = false,
+          lines = tracked.Keys.ToArray(),
+          breakpoints = BreakpointSpecsToJson(tracked),
+          warning = "debuggee terminated and Unity exited; breakpoints preserved locally"
+        };
+      }
+
       var breakpoints = new JArray(tracked.Values.Select(bp => bp.ToDap()));
       var response = m_Client.Request("setBreakpoints", new JObject
       {
@@ -1975,7 +1973,6 @@ namespace UnityDebugAdapter
         ["sourceModified"] = false
       });
       EnsureSuccess(response);
-      m_LastStoppedEvent = null;
       SaveTranscript();
       return new
       {
@@ -2177,7 +2174,31 @@ namespace UnityDebugAdapter
     {
       EnsureAttached();
       var timeout = (double?)args["timeoutSeconds"] ?? 60.0;
-      m_LastStoppedEvent = m_Client.WaitEvent("stopped", timeout);
+
+      try
+      {
+        m_LastStoppedEvent = m_Client.WaitEvent("stopped", timeout);
+      }
+      catch (TimeoutException ex)
+      {
+        var reason = ex.Message.Contains("terminated")
+            ? "debuggee terminated while waiting for breakpoint hit"
+            : ex.Message.Contains("adapter exited")
+                ? "debug adapter process exited unexpectedly"
+                : "no breakpoint hit within timeout";
+
+        return new
+        {
+          sessionId = SessionId,
+          stopped = false,
+          reason,
+          hint = reason.Contains("terminated") || reason.Contains("exited unexpectedly")
+              ? "The Unity debugger connection was lost. The breakpoint may not be on an executable line, or Unity may have exited Play Mode. You can try: (1) check the breakpoint line is on executable code, (2) call attach to reconnect, (3) call status to check session state."
+              : "The breakpoint was not hit within the timeout. Check that the breakpoint is on an executable code line (not a method signature, comment, or blank line).",
+          status = Status()
+        };
+      }
+
       var stoppedBody = m_LastStoppedEvent["body"];
 
       // Auto-snapshot: fetch stack, variables, and (optionally) evaluations
@@ -2678,13 +2699,33 @@ namespace UnityDebugAdapter
         if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
           return new string[0];
         using (var stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-        using (var reader = new StreamReader(stream, Encoding.UTF8, true))
         {
-          var lines = new List<string>();
-          string line;
-          while ((line = reader.ReadLine()) != null)
-            lines.Add(line);
-          return lines.TakeLastSafe(count).ToArray();
+          // Seek from the end using a ring buffer to avoid reading the entire file.
+          var ring = new string[count];
+          var ringIndex = 0;
+          var totalLines = 0;
+
+          // Use a modest buffer for reverse scanning; fall back to full read for small files.
+          if (stream.Length > 0)
+          {
+            stream.Seek(0, SeekOrigin.Begin);
+            using (var reader = new StreamReader(stream, Encoding.UTF8, true, 4096, leaveOpen: true))
+            {
+              string line;
+              while ((line = reader.ReadLine()) != null)
+              {
+                ring[ringIndex] = line;
+                ringIndex = (ringIndex + 1) % count;
+                totalLines++;
+              }
+            }
+          }
+
+          var result = new string[Math.Min(totalLines, count)];
+          var start = totalLines > count ? ringIndex : 0;
+          for (var i = 0; i < result.Length; i++)
+            result[i] = ring[(start + i) % count];
+          return result;
         }
       }
       catch (Exception e)
@@ -2819,7 +2860,9 @@ namespace UnityDebugAdapter
       }
       catch
       {
-        return ProcessExists(UnityPid);
+        // Process object is stale; re-acquire and retry.
+        m_UnityProcess = TryGetProcessById(UnityPid);
+        return m_UnityProcess != null;
       }
     }
 
@@ -2830,8 +2873,59 @@ namespace UnityDebugAdapter
 
     void EnsureAttached()
     {
-      if (!IsAttached())
+      if (!m_Attached)
         throw new InvalidOperationException("debug session is detached; call unity_debug_session with action=attach first");
+
+      // Adapter process crashed without sending terminated
+      if (m_Client == null || !m_Client.IsRunning)
+      {
+        m_Attached = false;
+        if (IsUnityProcessAlive())
+        {
+          Reconnect();
+          return;
+        }
+        throw new InvalidOperationException("debug adapter process exited unexpectedly (Unity pid=" + UnityPid + ")");
+      }
+
+      // Check for pending terminated event from the adapter
+      if (!CheckAndReconnectIfTerminated())
+        throw new InvalidOperationException("debuggee terminated and Unity process (pid=" + UnityPid + ") is no longer running");
+    }
+
+    void Reconnect()
+    {
+      Logger.LogInfo("MCP auto-reconnect: adapter session terminated, Unity still alive (pid={0})", UnityPid);
+      // Minimal teardown — do NOT call public Detach() because it calls Continue()
+      // which calls EnsureAttached() → Reconnect() → infinite recursion.
+      if (m_Client != null)
+      {
+        SaveTranscript();
+        try { m_Client.Disconnect(); } catch { }
+        if (m_Client.IsRunning)
+          m_Client.Stop();
+        m_Client = null;
+      }
+      m_Attached = false;
+      m_LastStoppedEvent = null;
+      // Reuse Attach for full reconnection: ResetUnityDebugger, StartAdapterClient,
+      // DAP attach with retry, SyncAllBreakpoints.
+      Attach(new JObject(), startUnityIfNoPid: false);
+    }
+
+    bool CheckAndReconnectIfTerminated()
+    {
+      if (m_Client == null || !m_Client.IsRunning)
+        return m_Attached;
+      if (!m_Client.DrainAndCheckTerminated())
+        return true; // session healthy
+      m_Attached = false;
+      if (IsUnityProcessAlive())
+      {
+        Reconnect();
+        return true;
+      }
+      return false; // terminated and Unity gone
     }
 
     static Process TryGetProcessById(int pid)
@@ -2844,25 +2938,6 @@ namespace UnityDebugAdapter
       {
         return null;
       }
-    }
-
-    static bool ProcessExists(int pid)
-    {
-      foreach (var process in Process.GetProcesses())
-      {
-        try
-        {
-          if (process.Id == pid)
-            return true;
-        }
-        catch { }
-        finally
-        {
-          process.Dispose();
-        }
-      }
-
-      return false;
     }
 
     static Process[] FindUnityProcesses(string projectPath)
@@ -3171,26 +3246,63 @@ namespace UnityDebugAdapter
 
     static string FindUnityExe()
     {
-      var root = @"C:\Program Files\Unity\Hub\Editor";
-      if (!Directory.Exists(root))
-        return null;
-      return Directory.GetDirectories(root)
-          .Where(path => Path.GetFileName(path).StartsWith("2022.3."))
-          .OrderByDescending(path => path)
-          .Select(path => Path.Combine(path, "Editor", "Unity.exe"))
-          .FirstOrDefault(File.Exists);
+      // Search Unity Hub editor directories for any installed version.
+      // Prioritize 2022.3.x (known compatible), then fall back to newest.
+      var candidates = new List<string>();
+      candidates.Add(@"C:\Program Files\Unity\Hub\Editor");
+      candidates.Add("/Applications/Unity/Hub/Editor");
+      candidates.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Unity", "Hub", "Editor"));
+
+      foreach (var root in candidates)
+      {
+        if (!Directory.Exists(root))
+          continue;
+
+        var exeName = root.StartsWith("/") ? "Unity.app/Contents/MacOS/Unity" : Path.Combine("Editor", "Unity.exe");
+
+        // Prefer 2022.3.x for compatibility, then fall back to newest version
+        var dirs = Directory.GetDirectories(root);
+        var preferred = dirs.Where(d => Path.GetFileName(d).StartsWith("2022.3."))
+            .OrderByDescending(path => path)
+            .Concat(dirs.Where(d => !Path.GetFileName(d).StartsWith("2022.3."))
+                .OrderByDescending(path => path, NaturalPathComparer.Instance))
+            .Select(path => Path.Combine(path, exeName))
+            .FirstOrDefault(File.Exists);
+        if (preferred != null)
+          return preferred;
+      }
+
+      return null;
+    }
+
+    /// <summary>Compares directory names containing version numbers in natural order (e.g. 2022.3.0f1 &lt; 2022.3.1f1).</summary>
+    sealed class NaturalPathComparer : IComparer<string>
+    {
+      public static readonly NaturalPathComparer Instance = new NaturalPathComparer();
+      public int Compare(string x, string y)
+      {
+        var nx = Path.GetFileName(x) ?? "";
+        var ny = Path.GetFileName(y) ?? "";
+        return StringComparer.OrdinalIgnoreCase.Compare(nx, ny);
+      }
     }
 
     static void KillUnityHubLicensing()
     {
+      // Only kill the Licensing Client; the Hub itself manages multiple
+      // projects and killing it system-wide can disrupt other work.
       foreach (var process in Process.GetProcesses())
       {
         try
         {
-          if (process.ProcessName == "Unity Hub" || process.ProcessName == "Unity.Licensing.Client")
+          if (process.ProcessName == "Unity.Licensing.Client")
             process.Kill();
         }
         catch { }
+        finally
+        {
+          process.Dispose();
+        }
       }
       System.Threading.Thread.Sleep(3000);
     }
@@ -3198,6 +3310,9 @@ namespace UnityDebugAdapter
 
   internal class DapProcessClient
   {
+    const int MaxTranscriptEntries = 2000;
+    const int MaxEventEntries = 500;
+
     readonly string m_AdapterPath;
     readonly string m_LogPath;
     readonly double m_RequestTimeoutSeconds;
@@ -3208,7 +3323,11 @@ namespace UnityDebugAdapter
 
     public List<JObject> Events { get; } = new List<JObject>();
     public List<JObject> Transcript { get; } = new List<JObject>();
-    public List<string> StderrLines { get; } = new List<string>();
+    readonly ConcurrentQueue<string> m_StderrLines = new ConcurrentQueue<string>();
+    public IReadOnlyList<string> StderrLines
+    {
+      get { return m_StderrLines.ToArray(); }
+    }
     public bool IsRunning => m_Process != null && !m_Process.HasExited;
 
     public DapProcessClient(string adapterPath, string logPath, double requestTimeoutSeconds)
@@ -3259,6 +3378,8 @@ namespace UnityDebugAdapter
         ["time"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
         ["message"] = request.DeepClone()
       });
+      if (Transcript.Count > MaxTranscriptEntries)
+        Transcript.RemoveRange(0, Transcript.Count - MaxTranscriptEntries);
 
       if (m_Process.HasExited)
         throw new InvalidOperationException("adapter exited before request " + command + " with code " + m_Process.ExitCode);
@@ -3386,6 +3507,23 @@ namespace UnityDebugAdapter
       catch { }
     }
 
+    /// <summary>
+    /// Non-blocking drain of m_Messages.  Records all drained messages into the
+    /// transcript and events list.  Returns true if a terminated event was found.
+    /// Must be called on the MCP main thread (same as Record/WaitResponse).
+    /// </summary>
+    public bool DrainAndCheckTerminated()
+    {
+      bool found = false;
+      while (m_Messages.TryTake(out var message, 0))
+      {
+        Record(message);
+        if ((string)message["type"] == "event" && (string)message["event"] == "terminated")
+          found = true;
+      }
+      return found;
+    }
+
     void ReadStdout()
     {
       var stream = m_Process.StandardOutput.BaseStream;
@@ -3418,7 +3556,7 @@ namespace UnityDebugAdapter
     {
       string line;
       while ((line = m_Process.StandardError.ReadLine()) != null)
-        StderrLines.Add(line);
+        m_StderrLines.Enqueue(line);
     }
 
     void Record(JObject message, bool bufferEvent = true)
@@ -3429,10 +3567,14 @@ namespace UnityDebugAdapter
         ["time"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
         ["message"] = message.DeepClone()
       });
+      if (Transcript.Count > MaxTranscriptEntries)
+        Transcript.RemoveRange(0, Transcript.Count - MaxTranscriptEntries);
       if ((string)message["type"] == "event")
       {
         var eventCopy = (JObject)message.DeepClone();
         Events.Add(eventCopy);
+        if (Events.Count > MaxEventEntries)
+          Events.RemoveRange(0, Events.Count - MaxEventEntries);
         if (bufferEvent)
           m_PendingEvents.Enqueue((JObject)eventCopy.DeepClone());
       }

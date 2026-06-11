@@ -19,7 +19,7 @@ public static class McpPlayModeController
   static readonly object s_Lock = new object();
   static TcpListener s_Listener;
   static Thread s_ServerThread;
-  static bool s_Stopping;
+  static volatile bool s_Stopping;
 
   static McpPlayModeController()
   {
